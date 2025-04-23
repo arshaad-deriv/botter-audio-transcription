@@ -4,6 +4,14 @@ import os
 os.environ['SDL_VIDEODRIVER'] = 'dummy'
 
 import streamlit as st
+
+# Set page configuration (must be the first Streamlit command)
+st.set_page_config(
+    page_title="Audio Transcription App",
+    page_icon="🎙️",
+    layout="wide",
+)
+
 import tempfile
 import time
 import numpy as np
@@ -33,11 +41,13 @@ if not is_cloud_env:
         import soundfile as sf
         AUDIO_RECORDING_AVAILABLE = True
     except (ImportError, OSError) as e:
-        st.sidebar.warning(f"Audio recording disabled: {str(e)}")
+        # Store warning message for later display to avoid st commands before set_page_config
+        audio_import_error = f"Audio recording disabled: {str(e)}"
         AUDIO_RECORDING_AVAILABLE = False
 else:
     AUDIO_RECORDING_AVAILABLE = False
-    st.sidebar.warning("Audio recording is not available in cloud environments.")
+    # Store warning message for later display
+    cloud_warning = "Audio recording is not available in cloud environments."
 
 # Continue with other imports that should work anywhere
 import openai
@@ -876,14 +886,13 @@ def evaluation_callback():
 # BEGIN STREAMLIT UI SECTION
 # ======================================
 
-# Set page configuration
-st.set_page_config(
-    page_title="Audio Transcription App",
-    page_icon="🎙️",
-    layout="wide",
-)
+# Display any warnings that were stored earlier
+if not is_cloud_env and not AUDIO_RECORDING_AVAILABLE and 'audio_import_error' in locals():
+    st.sidebar.warning(audio_import_error)
+elif is_cloud_env:
+    st.sidebar.warning(cloud_warning)
 
-# Custom CSS
+# Custom CSS (the duplicate set_page_config call was removed)
 st.markdown("""
 <style>
 .main {
@@ -989,6 +998,99 @@ st.markdown("""
         border-left: 4px solid #4527A0;
     }
 }
+
+/* Category heading styles */
+.category-heading {
+    margin-top: 20px;
+    margin-bottom: 10px;
+}
+
+/* Category styling */
+.category-overall {
+    background-color: #FBC02D;  /* Amber/Yellow */
+    border-radius: 5px;
+    padding: 2px 8px;
+    margin-right: 10px;
+    font-weight: bold;
+    color: #333333;  /* Dark text for better contrast on yellow */
+}
+
+.category-completed {
+    background-color: #2E7D32;  /* Green */
+    border-radius: 5px;
+    padding: 2px 8px;
+    margin-right: 10px;
+    font-weight: bold;
+}
+.category-ongoing {
+    background-color: #1565C0;  /* Blue */
+    border-radius: 5px;
+    padding: 2px 8px;
+    margin-right: 10px;
+    font-weight: bold;
+}
+.category-blockers {
+    background-color: #C62828;  /* Red */
+    border-radius: 5px;
+    padding: 2px 8px;
+    margin-right: 10px;
+    font-weight: bold;
+}
+.category-ideas {
+    background-color: #6A1B9A;  /* Purple */
+    border-radius: 5px;
+    padding: 2px 8px;
+    margin-right: 10px;
+    font-weight: bold;
+}
+.category-todo {
+    background-color: #F9A825;  /* Amber */
+    border-radius: 5px;
+    padding: 2px 8px;
+    margin-right: 10px;
+    font-weight: bold;
+    color: #333333;
+}
+.category-action {
+    background-color: #D84315;  /* Deep Orange */
+    border-radius: 5px;
+    padding: 2px 8px;
+    margin-right: 10px;
+    font-weight: bold;
+}
+
+/* List formatting for better readability */
+.summary-container ul {
+    margin-top: 10px;
+    margin-bottom: 15px;
+    padding-left: 25px;
+}
+
+.summary-container li {
+    margin-bottom: 5px;
+    line-height: 1.5;
+}
+
+/* Main summary container styling */
+.summary-container {
+    background-color: #1A237E;  /* Deep indigo background */
+    border-radius: 10px;
+    padding: 20px;
+    margin-top: 20px;
+    color: #FFFFFF;  /* White text for better contrast */
+    font-weight: 500;
+    box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+    border-left: 4px solid #0D1A5E;  /* Darker accent */
+}
+
+/* For dark mode support */
+@media (prefers-color-scheme: dark) {
+    .category-todo, .category-overall {
+        color: #333333;  /* Keep dark text on light background */
+    }
+}
+
+/* Category heading styles */
 </style>
 """, unsafe_allow_html=True)
 
@@ -1970,154 +2072,3 @@ if is_cloud_env:
 # Footer
 st.markdown("---")
 st.markdown("Built with Streamlit and OpenAI's speech recognition technology")
-
-# Add CSS for summary container and category styling
-st.markdown("""
-<style>
-.summary-container {
-    background-color: #1A237E;  /* Deep indigo background */
-    border-radius: 10px;
-    padding: 20px;
-    margin-top: 20px;
-    color: #FFFFFF;  /* White text for better contrast */
-    font-weight: 500;
-    box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
-    border-left: 4px solid #0D1A5E;  /* Darker accent */
-}
-
-/* Category heading styles */
-.category-heading {
-    margin-top: 20px;
-    margin-bottom: 10px;
-}
-
-/* Category styling */
-.category-overall {
-    background-color: #FBC02D;  /* Amber/Yellow */
-    border-radius: 5px;
-    padding: 2px 8px;
-    margin-right: 10px;
-    font-weight: bold;
-    color: #333333;  /* Dark text for better contrast on yellow */
-}
-
-.category-completed {
-    background-color: #2E7D32;  /* Green */
-    border-radius: 5px;
-    padding: 2px 8px;
-    margin-right: 10px;
-    font-weight: bold;
-}
-.category-ongoing {
-    background-color: #1565C0;  /* Blue */
-    border-radius: 5px;
-    padding: 2px 8px;
-    margin-right: 10px;
-    font-weight: bold;
-}
-.category-blockers {
-    background-color: #C62828;  /* Red */
-    border-radius: 5px;
-    padding: 2px 8px;
-    margin-right: 10px;
-    font-weight: bold;
-}
-.category-ideas {
-    background-color: #6A1B9A;  /* Purple */
-    border-radius: 5px;
-    padding: 2px 8px;
-    margin-right: 10px;
-    font-weight: bold;
-}
-.category-todo {
-    background-color: #F9A825;  /* Amber */
-    border-radius: 5px;
-    padding: 2px 8px;
-    margin-right: 10px;
-    font-weight: bold;
-    color: #333333;
-}
-.category-action {
-    background-color: #D84315;  /* Deep Orange */
-    border-radius: 5px;
-    padding: 2px 8px;
-    margin-right: 10px;
-    font-weight: bold;
-}
-
-/* Enhanced styling for evaluation container and elements */
-.evaluation-container {
-    background-color: #5E35B1;  /* Purple background */
-    border-radius: 10px;
-    padding: 20px;
-    margin-top: 20px;
-    color: #FFFFFF;  /* White text for better contrast */
-    font-weight: 500;
-    box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
-    border-left: 4px solid #4527A0;  /* Darker purple accent */
-}
-
-.evaluation-list {
-    margin-top: 10px;
-    margin-bottom: 15px;
-    padding-left: 25px;
-}
-
-.evaluation-list li {
-    margin-bottom: 12px;
-    line-height: 1.6;
-    font-size: 1.02em;
-}
-
-.evaluation-rating {
-    font-size: 1.3em;
-    font-weight: bold;
-    color: #FFC107;  /* Amber color for rating */
-    margin-top: 25px;
-    margin-bottom: 15px;
-    padding: 8px 15px;
-    background-color: rgba(0, 0, 0, 0.2);
-    border-radius: 5px;
-    display: inline-block;
-}
-
-.evaluation-justification {
-    font-style: italic;
-    margin-bottom: 15px;
-    line-height: 1.6;
-    padding: 10px;
-    background-color: rgba(0, 0, 0, 0.1);
-    border-radius: 5px;
-    font-size: 1.05em;
-}
-
-/* List formatting for better readability */
-.summary-container ul {
-    margin-top: 10px;
-    margin-bottom: 15px;
-    padding-left: 25px;
-}
-
-.summary-container li {
-    margin-bottom: 5px;
-    line-height: 1.5;
-}
-
-/* For dark mode support */
-@media (prefers-color-scheme: dark) {
-    .summary-container {
-        background-color: #1A237E;
-        color: #FFFFFF;
-        border-left: 4px solid #0D1A5E;
-    }
-    .category-todo, .category-overall {
-        color: #333333;  /* Keep dark text on light background */
-    }
-    .evaluation-container {
-        background-color: #5E35B1;
-        color: #FFFFFF;
-        border-left: 4px solid #4527A0;
-    }
-}
-</style>
-""", unsafe_allow_html=True)

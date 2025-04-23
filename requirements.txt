@@ -2,8 +2,9 @@ streamlit==1.27.0
 openai==1.5.0
 pydub==0.25.1
 numpy>=1.26.0
-sounddevice==0.4.6
-soundfile==0.12.1
+# Mark audio packages as optional for cloud deployment
+# sounddevice==0.4.6
+# soundfile==0.12.1
 python-dotenv==1.0.0
 watchdog==3.0.0
 websocket-client==1.6.0 
