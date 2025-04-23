@@ -1327,8 +1327,10 @@ else:  # Main app content
         file_tab = tabs[0]
     else:
         # In local environment, show all tabs
-        tabs = st.tabs(["Microphone Recording", "Real-time Transcription", "File Upload"])
-        mic_tab, realtime_tab, file_tab = tabs
+        # tabs = st.tabs(["Microphone Recording", "Real-time Transcription", "File Upload"])
+        # mic_tab, realtime_tab, file_tab = tabs
+        tabs = st.tabs(["Microphone Recording", "File Upload"])
+        mic_tab, file_tab = tabs
     
     # Only display microphone tab if we're in a local environment
     if not is_cloud_env and AUDIO_RECORDING_AVAILABLE:
@@ -1560,208 +1562,208 @@ else:  # Main app content
                             st.error("Recording failed. Please check your microphone permissions.")
 
     # Only display real-time tab if we're in a local environment
-    with realtime_tab:
-        st.header("Real-time Transcription with GPT-4o")
-        st.markdown("Transcribe audio in real-time using OpenAI's Realtime API and gpt-4o-transcribe model")
-        
-        # Initialize session state for streaming
-        if 'realtime_streaming' not in st.session_state:
-            st.session_state.realtime_streaming = False
-            st.session_state.realtime_transcriber = None
-            st.session_state.ws_error = None
-        
-        # Display any WebSocket connection errors
-        if st.session_state.get('ws_error'):
-            st.error(f"WebSocket Error: {st.session_state.ws_error}")
-            st.session_state.ws_error = None
-        
-        # Start/Stop streaming buttons
-        col1, col2 = st.columns(2)
-        with col1:
-            start_button = st.button("Start Streaming", type="primary", disabled=st.session_state.realtime_streaming, key="start_realtime")
-        with col2:
-            stop_button = st.button("Stop Streaming", type="secondary", disabled=not st.session_state.realtime_streaming, key="stop_realtime")
-        
-        # Transcript placeholder
-        realtime_transcript_container = st.empty()
-        
-        if start_button:
-            # Get API key from secrets, environment, or user input
-            api_key = get_api_key("OPENAI_API_KEY") or st.session_state.get('openai_api_key')
-            if not api_key:
-                st.error("API key is required for real-time transcription")
-            else:
-                st.session_state.realtime_streaming = True
-                st.session_state.realtime_transcriber = RealtimeTranscription(api_key)
-                
-                try:
-                    success = st.session_state.realtime_transcriber.start()
-                    if success:
-                        realtime_transcript_container.markdown("<div class='real-time-transcript'>Listening... (WebSocket connection with GPT-4o Transcribe)</div>", unsafe_allow_html=True)
-                        
-                        # Check if connection was successful after a short delay
-                        time.sleep(2)
-                        if not st.session_state.realtime_transcriber.is_connected:
-                            error = st.session_state.realtime_transcriber.get_error() or "Failed to establish WebSocket connection"
-                            st.session_state.ws_error = f"{error}. Please check your API key and try again."
-                            st.session_state.realtime_streaming = False
-                            st.session_state.realtime_transcriber.stop()
-                            st.session_state.realtime_transcriber = None
-                            st.rerun()
-                    else:
-                        # Get the error from the transcriber
-                        error = st.session_state.realtime_transcriber.get_error() or "Failed to start real-time transcription"
-                        st.error(error)
-                        st.session_state.realtime_streaming = False
-                        st.session_state.realtime_transcriber = None
-                except Exception as e:
-                    st.session_state.ws_error = str(e)
-                    st.session_state.realtime_streaming = False
-                    st.rerun()
-                
-                # Rerun to update UI state
-                st.rerun()
-        
-        if stop_button and st.session_state.realtime_streaming:
-            if st.session_state.realtime_transcriber:
-                st.session_state.realtime_transcriber.stop()
-                final_transcript = st.session_state.realtime_transcriber.get_transcript()
-                realtime_transcript_container.markdown(f"<div class='real-time-transcript'>{final_transcript}</div>", unsafe_allow_html=True)
-                st.session_state.realtime_streaming = False
-                
-                # Add download button for real-time transcription
-                get_text_download_link(
-                    final_transcript,
-                    "realtime_transcription.txt",
-                    "📥 Download Transcription"
-                )
-                
-                # Store transcription in session state
-                st.session_state.rt_transcription = final_transcript
-                
-                # Success message
-                st.success("Transcription completed!")
-                
-                # Add summary options if transcript is available
-                if final_transcript:
-                    st.markdown("### Generate Summary")
-                    rt_summary_col1, rt_summary_col2 = st.columns(2)
-                    rt_summary_container = st.empty()
-                    
-                    # Add keys to session state to track button clicks without page rerun
-                    if 'rt_meeting_summary_clicked' not in st.session_state:
-                        st.session_state.rt_meeting_summary_clicked = False
-                    if 'rt_general_summary_clicked' not in st.session_state:
-                        st.session_state.rt_general_summary_clicked = False
-                    
-                    # Create functions to update state without page rerun
-                    def rt_meeting_summary_callback():
-                        st.session_state.rt_meeting_summary_clicked = True
-                    
-                    def rt_general_summary_callback():
-                        st.session_state.rt_general_summary_clicked = True
-                    
-                    with rt_summary_col1:
-                        st.button("Meeting Conversation", key="rt_meeting_summary_btn", on_click=rt_meeting_summary_callback)
-                    
-                    with rt_summary_col2:
-                        st.button("General Summary", key="rt_general_summary_btn", on_click=rt_general_summary_callback)
-                    
-                    # Generate and display summaries without page rerun
-                    if st.session_state.rt_meeting_summary_clicked:
-                        with st.spinner("Generating meeting summary..."):
-                            # Check if summary already exists in session state
-                            if 'rt_meeting_summary' not in st.session_state.summaries:
-                                meeting_summary = generate_summary(final_transcript, "meeting")
-                                if meeting_summary:
-                                    st.session_state.summaries['rt_meeting_summary'] = meeting_summary
-                            st.session_state.rt_meeting_summary_clicked = False  # Reset for next time
-                            
-                            # Display the formatted summary
-                            if 'rt_meeting_summary' in st.session_state.summaries:
-                                rt_summary_container.markdown("### Meeting Summary")
-                                # Apply formatting to the meeting summary
-                                formatted_summary = format_meeting_summary(st.session_state.summaries['rt_meeting_summary'])
-                                rt_summary_container.markdown(
-                                    f"<div class='summary-container'>{formatted_summary}</div>", 
-                                    unsafe_allow_html=True
-                                )
-                                
-                                # Add download button for meeting summary
-                                get_text_download_link(
-                                    st.session_state.summaries['rt_meeting_summary'],
-                                    "realtime_meeting_summary.txt",
-                                    "📥 Download Meeting Summary"
-                                )
-                    
-                    if st.session_state.rt_general_summary_clicked:
-                        with st.spinner("Generating general summary..."):
-                            # Check if summary already exists in session state
-                            if 'rt_general_summary' not in st.session_state.summaries:
-                                general_summary = generate_summary(final_transcript, "general")
-                                if general_summary:
-                                    st.session_state.summaries['rt_general_summary'] = general_summary
-                            st.session_state.rt_general_summary_clicked = False  # Reset for next time
-                            
-                            # Display the summary
-                            if 'rt_general_summary' in st.session_state.summaries:
-                                rt_summary_container.markdown("### General Summary")
-                                rt_summary_container.markdown(
-                                    f"<div class='summary-container'>{st.session_state.summaries['rt_general_summary']}</div>", 
-                                    unsafe_allow_html=True
-                                )
-                                
-                                # Add download button for general summary from previous run
-                                get_text_download_link(
-                                    st.session_state.summaries['rt_general_summary'],
-                                    "realtime_general_summary.txt",
-                                    "📥 Download General Summary"
-                                )
-                    
-                    # Check if we have any summaries from previous runs to display
-                    if not st.session_state.rt_meeting_summary_clicked and not st.session_state.rt_general_summary_clicked:
-                        if 'rt_meeting_summary' in st.session_state.summaries:
-                            rt_summary_container.markdown("### Meeting Summary")
-                            # Apply formatting to the meeting summary
-                            formatted_summary = format_meeting_summary(st.session_state.summaries['rt_meeting_summary'])
-                            rt_summary_container.markdown(
-                                f"<div class='summary-container'>{formatted_summary}</div>", 
-                                unsafe_allow_html=True
-                            )
-                            
-                            # Add download button for meeting summary from previous run
-                            get_text_download_link(
-                                st.session_state.summaries['rt_meeting_summary'],
-                                "realtime_meeting_summary.txt",
-                                "📥 Download Meeting Summary"
-                            )
-                        elif 'rt_general_summary' in st.session_state.summaries:
-                            rt_summary_container.markdown("### General Summary")
-                            rt_summary_container.markdown(
-                                f"<div class='summary-container'>{st.session_state.summaries['rt_general_summary']}</div>", 
-                                unsafe_allow_html=True
-                            )
-                            
-                            # Add download button for general summary from previous run
-                            get_text_download_link(
-                                st.session_state.summaries['rt_general_summary'],
-                                "realtime_general_summary.txt",
-                                "📥 Download General Summary"
-                            )
-                
-                # Rerun to update UI state
-                st.rerun()
-        
-        # Update the transcript in real-time if streaming
-        if st.session_state.realtime_streaming and st.session_state.realtime_transcriber:
-            # Update every second
-            current_transcript = st.session_state.realtime_transcriber.get_transcript()
-            if current_transcript:
-                realtime_transcript_container.markdown(f"<div class='real-time-transcript'>{current_transcript}</div>", unsafe_allow_html=True)
-            
-            # Add automatic rerun for real-time updates
-            time.sleep(0.5)  # Brief pause
-            st.rerun()
+    # with realtime_tab:
+    #     st.header("Real-time Transcription with GPT-4o")
+    #     st.markdown("Transcribe audio in real-time using OpenAI's Realtime API and gpt-4o-transcribe model")
+    #     
+    #     # Initialize session state for streaming
+    #     if 'realtime_streaming' not in st.session_state:
+    #         st.session_state.realtime_streaming = False
+    #         st.session_state.realtime_transcriber = None
+    #         st.session_state.ws_error = None
+    #     
+    #     # Display any WebSocket connection errors
+    #     if st.session_state.get('ws_error'):
+    #         st.error(f"WebSocket Error: {st.session_state.ws_error}")
+    #         st.session_state.ws_error = None
+    #     
+    #     # Start/Stop streaming buttons
+    #     col1, col2 = st.columns(2)
+    #     with col1:
+    #         start_button = st.button("Start Streaming", type="primary", disabled=st.session_state.realtime_streaming, key="start_realtime")
+    #     with col2:
+    #         stop_button = st.button("Stop Streaming", type="secondary", disabled=not st.session_state.realtime_streaming, key="stop_realtime")
+    #     
+    #     # Transcript placeholder
+    #     realtime_transcript_container = st.empty()
+    #     
+    #     if start_button:
+    #         # Get API key from secrets, environment, or user input
+    #         api_key = get_api_key("OPENAI_API_KEY") or st.session_state.get('openai_api_key')
+    #         if not api_key:
+    #             st.error("API key is required for real-time transcription")
+    #         else:
+    #             st.session_state.realtime_streaming = True
+    #             st.session_state.realtime_transcriber = RealtimeTranscription(api_key)
+    #             
+    #             try:
+    #                 success = st.session_state.realtime_transcriber.start()
+    #                 if success:
+    #                     realtime_transcript_container.markdown("<div class='real-time-transcript'>Listening... (WebSocket connection with GPT-4o Transcribe)</div>", unsafe_allow_html=True)
+    #                     
+    #                     # Check if connection was successful after a short delay
+    #                     time.sleep(2)
+    #                     if not st.session_state.realtime_transcriber.is_connected:
+    #                         error = st.session_state.realtime_transcriber.get_error() or "Failed to establish WebSocket connection"
+    #                         st.session_state.ws_error = f"{error}. Please check your API key and try again."
+    #                         st.session_state.realtime_streaming = False
+    #                         st.session_state.realtime_transcriber.stop()
+    #                         st.session_state.realtime_transcriber = None
+    #                         st.rerun()
+    #                 else:
+    #                     # Get the error from the transcriber
+    #                     error = st.session_state.realtime_transcriber.get_error() or "Failed to start real-time transcription"
+    #                     st.error(error)
+    #                     st.session_state.realtime_streaming = False
+    #                     st.session_state.realtime_transcriber = None
+    #             except Exception as e:
+    #                 st.session_state.ws_error = str(e)
+    #                 st.session_state.realtime_streaming = False
+    #                 st.rerun()
+    #             
+    #             # Rerun to update UI state
+    #             st.rerun()
+    #     
+    #     if stop_button and st.session_state.realtime_streaming:
+    #         if st.session_state.realtime_transcriber:
+    #             st.session_state.realtime_transcriber.stop()
+    #             final_transcript = st.session_state.realtime_transcriber.get_transcript()
+    #             realtime_transcript_container.markdown(f"<div class='real-time-transcript'>{final_transcript}</div>", unsafe_allow_html=True)
+    #             st.session_state.realtime_streaming = False
+    #             
+    #             # Add download button for real-time transcription
+    #             get_text_download_link(
+    #                 final_transcript,
+    #                 "realtime_transcription.txt",
+    #                 "📥 Download Transcription"
+    #             )
+    #             
+    #             # Store transcription in session state
+    #             st.session_state.rt_transcription = final_transcript
+    #             
+    #             # Success message
+    #             st.success("Transcription completed!")
+    #             
+    #             # Add summary options if transcript is available
+    #             if final_transcript:
+    #                 st.markdown("### Generate Summary")
+    #                 rt_summary_col1, rt_summary_col2 = st.columns(2)
+    #                 rt_summary_container = st.empty()
+    #                 
+    #                 # Add keys to session state to track button clicks without page rerun
+    #                 if 'rt_meeting_summary_clicked' not in st.session_state:
+    #                     st.session_state.rt_meeting_summary_clicked = False
+    #                 if 'rt_general_summary_clicked' not in st.session_state:
+    #                     st.session_state.rt_general_summary_clicked = False
+    #                 
+    #                 # Create functions to update state without page rerun
+    #                 def rt_meeting_summary_callback():
+    #                     st.session_state.rt_meeting_summary_clicked = True
+    #                 
+    #                 def rt_general_summary_callback():
+    #                     st.session_state.rt_general_summary_clicked = True
+    #                 
+    #                 with rt_summary_col1:
+    #                     st.button("Meeting Conversation", key="rt_meeting_summary_btn", on_click=rt_meeting_summary_callback)
+    #                 
+    #                 with rt_summary_col2:
+    #                     st.button("General Summary", key="rt_general_summary_btn", on_click=rt_general_summary_callback)
+    #                 
+    #                 # Generate and display summaries without page rerun
+    #                 if st.session_state.rt_meeting_summary_clicked:
+    #                     with st.spinner("Generating meeting summary..."):
+    #                         # Check if summary already exists in session state
+    #                         if 'rt_meeting_summary' not in st.session_state.summaries:
+    #                             meeting_summary = generate_summary(final_transcript, "meeting")
+    #                             if meeting_summary:
+    #                                 st.session_state.summaries['rt_meeting_summary'] = meeting_summary
+    #                         st.session_state.rt_meeting_summary_clicked = False  # Reset for next time
+    #                         
+    #                         # Display the formatted summary
+    #                         if 'rt_meeting_summary' in st.session_state.summaries:
+    #                             rt_summary_container.markdown("### Meeting Summary")
+    #                             # Apply formatting to the meeting summary
+    #                             formatted_summary = format_meeting_summary(st.session_state.summaries['rt_meeting_summary'])
+    #                             rt_summary_container.markdown(
+    #                                 f"<div class='summary-container'>{formatted_summary}</div>", 
+    #                                 unsafe_allow_html=True
+    #                             )
+    #                             
+    #                             # Add download button for meeting summary
+    #                             get_text_download_link(
+    #                                 st.session_state.summaries['rt_meeting_summary'],
+    #                                 "realtime_meeting_summary.txt",
+    #                                 "📥 Download Meeting Summary"
+    #                             )
+    #                 
+    #                 if st.session_state.rt_general_summary_clicked:
+    #                     with st.spinner("Generating general summary..."):
+    #                         # Check if summary already exists in session state
+    #                         if 'rt_general_summary' not in st.session_state.summaries:
+    #                             general_summary = generate_summary(final_transcript, "general")
+    #                             if general_summary:
+    #                                 st.session_state.summaries['rt_general_summary'] = general_summary
+    #                         st.session_state.rt_general_summary_clicked = False  # Reset for next time
+    #                         
+    #                         # Display the summary
+    #                         if 'rt_general_summary' in st.session_state.summaries:
+    #                             rt_summary_container.markdown("### General Summary")
+    #                             rt_summary_container.markdown(
+    #                                 f"<div class='summary-container'>{st.session_state.summaries['rt_general_summary']}</div>", 
+    #                                 unsafe_allow_html=True
+    #                             )
+    #                             
+    #                             # Add download button for general summary from previous run
+    #                             get_text_download_link(
+    #                                 st.session_state.summaries['rt_general_summary'],
+    #                                 "realtime_general_summary.txt",
+    #                                 "📥 Download General Summary"
+    #                             )
+    #                 
+    #                 # Check if we have any summaries from previous runs to display
+    #                 if not st.session_state.rt_meeting_summary_clicked and not st.session_state.rt_general_summary_clicked:
+    #                     if 'rt_meeting_summary' in st.session_state.summaries:
+    #                         rt_summary_container.markdown("### Meeting Summary")
+    #                         # Apply formatting to the meeting summary
+    #                         formatted_summary = format_meeting_summary(st.session_state.summaries['rt_meeting_summary'])
+    #                         rt_summary_container.markdown(
+    #                             f"<div class='summary-container'>{formatted_summary}</div>", 
+    #                             unsafe_allow_html=True
+    #                         )
+    #                         
+    #                         # Add download button for meeting summary from previous run
+    #                         get_text_download_link(
+    #                             st.session_state.summaries['rt_meeting_summary'],
+    #                             "realtime_meeting_summary.txt",
+    #                             "📥 Download Meeting Summary"
+    #                         )
+    #                     elif 'rt_general_summary' in st.session_state.summaries:
+    #                         rt_summary_container.markdown("### General Summary")
+    #                         rt_summary_container.markdown(
+    #                             f"<div class='summary-container'>{st.session_state.summaries['rt_general_summary']}</div>", 
+    #                             unsafe_allow_html=True
+    #                         )
+    #                         
+    #                         # Add download button for general summary from previous run
+    #                         get_text_download_link(
+    #                             st.session_state.summaries['rt_general_summary'],
+    #                             "realtime_general_summary.txt",
+    #                             "📥 Download General Summary"
+    #                         )
+    #             
+    #             # Rerun to update UI state
+    #             st.rerun()
+    #     
+    #     # Update the transcript in real-time if streaming
+    #     if st.session_state.realtime_streaming and st.session_state.realtime_transcriber:
+    #         # Update every second
+    #         current_transcript = st.session_state.realtime_transcriber.get_transcript()
+    #         if current_transcript:
+    #             realtime_transcript_container.markdown(f"<div class='real-time-transcript'>{current_transcript}</div>", unsafe_allow_html=True)
+    #         
+    #         # Add automatic rerun for real-time updates
+    #         time.sleep(0.5)  # Brief pause
+    #         st.rerun()
 
     # File upload tab (available in all environments)
     with file_tab:
