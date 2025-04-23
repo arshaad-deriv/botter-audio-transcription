@@ -7,25 +7,68 @@ import streamlit as st
 import tempfile
 import time
 import numpy as np
-import sounddevice as sd
-import soundfile as sf
-import openai
-import anthropic
-from pydub import AudioSegment
+# Import sounddevice conditionally
+import sys
+import platform
+import tempfile
+import time
 from dotenv import load_dotenv
 import base64
 import queue
 import threading
 import io
 import json
+import math
+
+# Detect if running in Streamlit Cloud
+is_cloud_env = os.environ.get('STREAMLIT_RUNTIME_IS_STREAMLIT_CLOUD') == 'true' or 'HOSTNAME' in os.environ
+
+# Initialize sounddevice as None
+sd = None
+
+# Try to import sounddevice only if not in cloud environment
+if not is_cloud_env:
+    try:
+        import sounddevice as sd
+        import soundfile as sf
+        AUDIO_RECORDING_AVAILABLE = True
+    except (ImportError, OSError) as e:
+        st.sidebar.warning(f"Audio recording disabled: {str(e)}")
+        AUDIO_RECORDING_AVAILABLE = False
+else:
+    AUDIO_RECORDING_AVAILABLE = False
+    st.sidebar.warning("Audio recording is not available in cloud environments.")
+
+# Continue with other imports that should work anywhere
+import openai
+import anthropic
+from pydub import AudioSegment
+import base64
 import websocket
 import audioop
 import struct
 from moviepy.editor import VideoFileClip  # For MP4 to MP3 conversion
-import math
 
-# Load environment variables
+# Load environment variables (for local development with .env file)
 load_dotenv()
+
+# Function to get API keys from Streamlit secrets or environment variables with fallback to user input
+def get_api_key(key_name):
+    """
+    Get API key from Streamlit secrets or environment variables with fallback
+    
+    Args:
+        key_name: Name of the API key to retrieve
+        
+    Returns:
+        API key value or None if not found
+    """
+    # First try to get from Streamlit secrets
+    if key_name in st.secrets:
+        return st.secrets[key_name]
+    
+    # Then try environment variables
+    return os.environ.get(key_name)
 
 # ======================================
 # FUNCTION DEFINITIONS SECTION
@@ -52,6 +95,29 @@ def get_text_download_link(text, filename, link_text):
     
     # Return the HTML to be displayed
     return st.markdown(html_link, unsafe_allow_html=True)
+
+# Function to record audio from microphone - only available in local environments
+def record_audio(duration):
+    """Record audio from microphone for specified duration"""
+    if not AUDIO_RECORDING_AVAILABLE or sd is None:
+        st.error("Microphone recording is not available in this environment")
+        return None
+    
+    sample_rate = 44100  # Sample rate in Hz
+    
+    # Create a temporary file to store the recording
+    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.wav')
+    temp_file_path = temp_file.name
+    temp_file.close()
+    
+    # Record audio from microphone
+    recording = sd.rec(int(duration * sample_rate), samplerate=sample_rate, channels=1)
+    sd.wait()  # Wait for recording to complete
+    
+    # Save the recording to the temporary file
+    sf.write(temp_file_path, recording, sample_rate)
+    
+    return temp_file_path
 
 # Function to split audio file into chunks of specified size
 def split_audio_file(audio_file_path, max_chunk_size_mb=24.5):
@@ -115,31 +181,15 @@ def split_audio_file(audio_file_path, max_chunk_size_mb=24.5):
         print(f"Audio splitting error: {str(e)}")
         return [audio_file_path]  # Return original file if splitting fails
 
-# Function to record audio from microphone
-def record_audio(duration):
-    """Record audio from microphone for specified duration"""
-    sample_rate = 44100  # Sample rate in Hz
-    
-    # Create a temporary file to store the recording
-    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.wav')
-    temp_file_path = temp_file.name
-    temp_file.close()
-    
-    # Record audio from microphone
-    recording = sd.rec(int(duration * sample_rate), samplerate=sample_rate, channels=1)
-    sd.wait()  # Wait for recording to complete
-    
-    # Save the recording to the temporary file
-    sf.write(temp_file_path, recording, sample_rate)
-    
-    return temp_file_path
-
 # Function to transcribe audio using OpenAI API
 def transcribe_audio(audio_file_path, model="whisper-1", translate=False):
     """Transcribe audio file using OpenAI's API"""
     try:
+        # Get API key from secrets or environment variables
+        api_key = get_api_key("OPENAI_API_KEY")
+        
         # Create a client instance
-        client = openai.OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+        client = openai.OpenAI(api_key=api_key)
         
         # Check if file needs to be split into chunks
         file_size = os.path.getsize(audio_file_path) / (1024 * 1024)  # Size in MB
@@ -311,6 +361,11 @@ class RealtimeTranscription:
         audio_thread.start()
     
     def capture_and_stream_audio(self):
+        if not AUDIO_RECORDING_AVAILABLE or sd is None:
+            self.error_message = "Microphone recording is not available in this environment"
+            self.stop()
+            return
+            
         # Audio parameters
         sample_rate = 16000
         chunk_size = 1024
@@ -354,6 +409,11 @@ class RealtimeTranscription:
         self.audio_queue.put(audio_data)
     
     def start(self):
+        # For cloud environments, don't attempt to use microphone
+        if not AUDIO_RECORDING_AVAILABLE and 'is_cloud_env' in globals() and is_cloud_env:
+            self.error_message = "Real-time transcription requires microphone access, which is not available in Streamlit Cloud environment."
+            return False
+
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json"
@@ -374,6 +434,7 @@ class RealtimeTranscription:
         ws_thread = threading.Thread(target=self.ws.run_forever)
         ws_thread.daemon = True
         ws_thread.start()
+        return True
     
     def stop(self):
         self.stop_event.set()
@@ -437,7 +498,7 @@ def generate_claude_summary(text, summary_type):
     """Generate a summary using Claude 3.7 API"""
     try:
         # Check if Claude API key is available
-        claude_key = os.environ.get("CLAUDE_API_KEY")
+        claude_key = get_api_key("CLAUDE_API_KEY")
         if not claude_key:
             st.warning("Claude API key is required for summaries. Please enter it in the sidebar.")
             return None
@@ -617,7 +678,7 @@ def prepare_transcript_for_claude(text, max_tokens=150000):
 def generate_claude_meeting_evaluation(text):
     try:
         # Check if Claude API key is available
-        claude_key = os.environ.get("CLAUDE_API_KEY")
+        claude_key = get_api_key("CLAUDE_API_KEY")
         if not claude_key:
             st.warning("Claude API key is required for Meeting Evaluation. Please enter it in the sidebar.")
             return None
@@ -986,13 +1047,20 @@ else:
 
 api_key = st.sidebar.text_input("Enter your OpenAI API Key", type="password")
 if api_key:
-    os.environ["OPENAI_API_KEY"] = api_key
-    openai.api_key = api_key
+    # Store in session state rather than directly in environment
+    if 'openai_api_key' not in st.session_state or st.session_state.openai_api_key != api_key:
+        st.session_state.openai_api_key = api_key
+        # Also set in environment for backward compatibility
+        os.environ["OPENAI_API_KEY"] = api_key
 
 # Add Claude API key input
 claude_api_key = st.sidebar.text_input("Enter your Claude API Key (for Claude summaries)", type="password")
 if claude_api_key:
-    os.environ["CLAUDE_API_KEY"] = claude_api_key
+    # Store in session state rather than directly in environment
+    if 'claude_api_key' not in st.session_state or st.session_state.claude_api_key != claude_api_key:
+        st.session_state.claude_api_key = claude_api_key
+        # Also set in environment for backward compatibility
+        os.environ["CLAUDE_API_KEY"] = claude_api_key
 
 # Add a separator
 st.sidebar.markdown("---")
@@ -1012,7 +1080,7 @@ if st.sidebar.button("Things to Add/Do", key="nav_todo"):
     st.session_state.current_page = "todo"
 
 # Check for API key
-if not os.environ.get("OPENAI_API_KEY") and not api_key:
+if not get_api_key("OPENAI_API_KEY") and not api_key:
     st.warning("Please enter your OpenAI API key in the sidebar to use this app")
     st.stop()
 
@@ -1148,234 +1216,249 @@ else:  # Main app content
         "GPT-4o Transcribe Mini": "gpt-4o-mini-transcribe"
     }
     
-    # Tabs for different input methods
-    tab1, tab2, tab3 = st.tabs(["Microphone Recording", "Real-time Transcription", "File Upload"])
-
-    with tab1:
-        st.header("Record Audio")
-        st.markdown("Use your microphone to record audio for transcription")
-        
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            duration = st.slider("Recording Duration (seconds)", min_value=5, max_value=60, value=10, step=5)
-        
-        with col2:
-            model_key = st.selectbox(
-                "Select Model",
-                list(SPEECH_MODELS.keys()),
-                index=0
-            )
-            model = SPEECH_MODELS[model_key]
-        
-        # Record button
-        if st.button("Start Recording", type="primary", key="record_btn"):
-            with st.spinner("Recording in progress..."):
-                audio_file_path = record_audio(duration)
-                
-                st.success("Recording completed!")
-                
-                # Add playback of the recorded audio
-                with open(audio_file_path, "rb") as f:
-                    audio_bytes = f.read()
-                
-                st.audio(audio_bytes, format="audio/wav")
-                
-                # Transcribe the audio
-                with st.spinner("Transcribing..."):
-                    transcription = transcribe_audio(audio_file_path, model)
-                
-                if transcription:
-                    # Store transcription in session state
-                    st.session_state.transcription = transcription
+    # Conditionally create tabs based on environment
+    if is_cloud_env or not AUDIO_RECORDING_AVAILABLE:
+        # In cloud environment, only show file upload tab
+        st.warning("🔴 **Microphone recording and real-time transcription** are disabled in cloud environments. Only file upload is available.")
+        # Create a single tab for file upload
+        tabs = st.tabs(["File Upload"])
+        file_tab = tabs[0]
+    else:
+        # In local environment, show all tabs
+        tabs = st.tabs(["Microphone Recording", "Real-time Transcription", "File Upload"])
+        mic_tab, realtime_tab, file_tab = tabs
+    
+    # Only display microphone tab if we're in a local environment
+    if not is_cloud_env and AUDIO_RECORDING_AVAILABLE:
+        with mic_tab:
+            st.header("Record Audio")
+            st.markdown("Use your microphone to record audio for transcription")
+            
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                duration = st.slider("Recording Duration (seconds)", min_value=5, max_value=60, value=10, step=5)
+            
+            with col2:
+                model_key = st.selectbox(
+                    "Select Model",
+                    list(SPEECH_MODELS.keys()),
+                    index=0
+                )
+                model = SPEECH_MODELS[model_key]
+            
+            # Record button
+            if st.button("Start Recording", type="primary", key="record_btn"):
+                with st.spinner("Recording in progress..."):
+                    audio_file_path = record_audio(duration)
                     
-                    st.markdown("### Transcription")
-                    st.markdown(f"<div class='transcription-container'>{transcription}</div>", unsafe_allow_html=True)
-                    
-                    # Add download button for transcription
-                    get_text_download_link(
-                        transcription, 
-                        "transcription.txt", 
-                        "📥 Download Transcription"
-                    )
-                    
-                    # Add summary options
-                    st.markdown("### Generate Summary")
-                    summary_col1, summary_col2 = st.columns(2)
-                    
-                    # Create functions to update state without page rerun
-                    def meeting_summary_callback():
-                        st.session_state.meeting_summary_clicked = True
-                    
-                    def general_summary_callback():
-                        st.session_state.general_summary_clicked = True
-                    
-                    with summary_col1:
-                        st.button("Meeting Conversation", key="meeting_summary_btn", on_click=meeting_summary_callback)
-                    
-                    with summary_col2:
-                        st.button("General Summary", key="general_summary_btn", on_click=general_summary_callback)
-                    
-                    # Generate Claude Meeting Evaluation automatically if Claude API key is available
-                    if os.environ.get("CLAUDE_API_KEY"):
-                        if 'meeting_evaluation' not in st.session_state.summaries:
-                            with st.spinner("Generating meeting evaluation with Claude 3.7..."):
-                                evaluation = generate_claude_meeting_evaluation(transcription)
-                                if evaluation:
-                                    st.session_state.summaries['meeting_evaluation'] = evaluation
-                    
-                    # Generate and display summaries without page rerun
-                    summary_container = st.empty()
-                    
-                    if st.session_state.meeting_summary_clicked:
-                        with st.spinner("Generating meeting summary..."):
-                            # Only generate if it doesn't exist
-                            if 'meeting_summary' not in st.session_state.summaries:
-                                meeting_summary = generate_summary(transcription, "meeting")
-                                if meeting_summary:
-                                    st.session_state.summaries['meeting_summary'] = meeting_summary
-                            st.session_state.meeting_summary_clicked = False  # Reset for next time
+                    if audio_file_path:
+                        st.success("Recording completed!")
+                        
+                        # Add playback of the recorded audio
+                        with open(audio_file_path, "rb") as f:
+                            audio_bytes = f.read()
+                        
+                        st.audio(audio_bytes, format="audio/wav")
+                        
+                        # Transcribe the audio
+                        with st.spinner("Transcribing..."):
+                            transcription = transcribe_audio(audio_file_path, model)
+                        
+                        if transcription:
+                            # Store transcription in session state
+                            st.session_state.transcription = transcription
                             
-                            # Display the formatted summary
-                            if 'meeting_summary' in st.session_state.summaries:
-                                summary_container.markdown("### Meeting Summary")
-                                # Apply formatting to the meeting summary
-                                formatted_summary = format_meeting_summary(st.session_state.summaries['meeting_summary'])
-                                summary_container.markdown(
-                                    f"<div class='summary-container'>{formatted_summary}</div>", 
-                                    unsafe_allow_html=True
-                                )
-                                
-                                # Add download button for meeting summary
-                                get_text_download_link(
-                                    st.session_state.summaries['meeting_summary'],
-                                    "meeting_summary.txt",
-                                    "📥 Download Meeting Summary"
-                                )
-                                
-                                # Display the meeting evaluation if available
-                                if 'meeting_evaluation' in st.session_state.summaries:
-                                    st.markdown("### Meeting Evaluation (Claude 3.7)")
-                                    formatted_evaluation = format_meeting_evaluation(st.session_state.summaries['meeting_evaluation'])
-                                    st.markdown(
-                                        f"<div class='evaluation-container'>{formatted_evaluation}</div>", 
+                            st.markdown("### Transcription")
+                            st.markdown(f"<div class='transcription-container'>{transcription}</div>", unsafe_allow_html=True)
+                            
+                            # Add download button for transcription
+                            get_text_download_link(
+                                transcription, 
+                                "transcription.txt", 
+                                "📥 Download Transcription"
+                            )
+                            
+                            # Add summary options
+                            st.markdown("### Generate Summary")
+                            summary_col1, summary_col2 = st.columns(2)
+                            
+                            # Create functions to update state without page rerun
+                            def meeting_summary_callback():
+                                st.session_state.meeting_summary_clicked = True
+                            
+                            def general_summary_callback():
+                                st.session_state.general_summary_clicked = True
+                            
+                            with summary_col1:
+                                st.button("Meeting Conversation", key="meeting_summary_btn", on_click=meeting_summary_callback)
+                            
+                            with summary_col2:
+                                st.button("General Summary", key="general_summary_btn", on_click=general_summary_callback)
+                            
+                            # Generate Claude Meeting Evaluation automatically if Claude API key is available
+                            if get_api_key("CLAUDE_API_KEY"):
+                                if 'meeting_evaluation' not in st.session_state.summaries:
+                                    with st.spinner("Generating meeting evaluation with Claude 3.7..."):
+                                        evaluation = generate_claude_meeting_evaluation(transcription)
+                                        if evaluation:
+                                            st.session_state.summaries['meeting_evaluation'] = evaluation
+                            
+                            # Generate and display summaries without page rerun
+                            summary_container = st.empty()
+                            
+                            if st.session_state.meeting_summary_clicked:
+                                with st.spinner("Generating meeting summary..."):
+                                    # Only generate if it doesn't exist
+                                    if 'meeting_summary' not in st.session_state.summaries:
+                                        meeting_summary = generate_summary(transcription, "meeting")
+                                        if meeting_summary:
+                                            st.session_state.summaries['meeting_summary'] = meeting_summary
+                                    st.session_state.meeting_summary_clicked = False  # Reset for next time
+                                    
+                                    # Display the formatted summary
+                                    if 'meeting_summary' in st.session_state.summaries:
+                                        summary_container.markdown("### Meeting Summary")
+                                        # Apply formatting to the meeting summary
+                                        formatted_summary = format_meeting_summary(st.session_state.summaries['meeting_summary'])
+                                        summary_container.markdown(
+                                            f"<div class='summary-container'>{formatted_summary}</div>", 
+                                            unsafe_allow_html=True
+                                        )
+                                        
+                                        # Add download button for meeting summary
+                                        get_text_download_link(
+                                            st.session_state.summaries['meeting_summary'],
+                                            "meeting_summary.txt",
+                                            "📥 Download Meeting Summary"
+                                        )
+                                        
+                                        # Display the meeting evaluation if available
+                                        if 'meeting_evaluation' in st.session_state.summaries:
+                                            st.markdown("### Meeting Evaluation (Claude 3.7)")
+                                            formatted_evaluation = format_meeting_evaluation(st.session_state.summaries['meeting_evaluation'])
+                                            st.markdown(
+                                                f"<div class='evaluation-container'>{formatted_evaluation}</div>", 
+                                                unsafe_allow_html=True
+                                            )
+                                            
+                                            # Add download button for evaluation
+                                            get_text_download_link(
+                                                st.session_state.summaries['meeting_evaluation'],
+                                                "meeting_evaluation.txt",
+                                                "📥 Download Meeting Evaluation"
+                                            )
+                            
+                            if st.session_state.general_summary_clicked:
+                                with st.spinner("Generating general summary..."):
+                                    # Check if summary already exists in session state
+                                    if 'general_summary' not in st.session_state.summaries:
+                                        general_summary = generate_summary(transcription, "general")
+                                        if general_summary:
+                                            st.session_state.summaries['general_summary'] = general_summary
+                                    st.session_state.general_summary_clicked = False  # Reset for next time
+                                    
+                                    # Display the summary
+                                    if 'general_summary' in st.session_state.summaries:
+                                        summary_container.markdown("### General Summary")
+                                        summary_container.markdown(
+                                            f"<div class='summary-container'>{st.session_state.summaries['general_summary']}</div>", 
+                                            unsafe_allow_html=True
+                                        )
+                                        
+                                        # Add download button for general summary
+                                        get_text_download_link(
+                                            st.session_state.summaries['general_summary'],
+                                            "general_summary.txt",
+                                            "📥 Download General Summary"
+                                        )
+                                        
+                                        # Display the meeting evaluation if available
+                                        if 'meeting_evaluation' in st.session_state.summaries:
+                                            st.markdown("### Meeting Evaluation (Claude 3.7)")
+                                            formatted_evaluation = format_meeting_evaluation(st.session_state.summaries['meeting_evaluation'])
+                                            st.markdown(
+                                                f"<div class='evaluation-container'>{formatted_evaluation}</div>", 
+                                                unsafe_allow_html=True
+                                            )
+                                            
+                                            # Add download button for evaluation
+                                            get_text_download_link(
+                                                st.session_state.summaries['meeting_evaluation'],
+                                                "meeting_evaluation.txt",
+                                                "📥 Download Meeting Evaluation"
+                                            )
+                            
+                            # Check if we have any summaries from previous runs to display
+                            if not st.session_state.meeting_summary_clicked and not st.session_state.general_summary_clicked:
+                                if 'meeting_summary' in st.session_state.summaries:
+                                    summary_container.markdown("### Meeting Summary")
+                                    # Apply formatting to the meeting summary
+                                    formatted_summary = format_meeting_summary(st.session_state.summaries['meeting_summary'])
+                                    summary_container.markdown(
+                                        f"<div class='summary-container'>{formatted_summary}</div>", 
                                         unsafe_allow_html=True
                                     )
                                     
-                                    # Add download button for evaluation
+                                    # Add download button for meeting summary from previous run
                                     get_text_download_link(
-                                        st.session_state.summaries['meeting_evaluation'],
-                                        "meeting_evaluation.txt",
-                                        "📥 Download Meeting Evaluation"
+                                        st.session_state.summaries['meeting_summary'],
+                                        "meeting_summary.txt",
+                                        "📥 Download Meeting Summary"
                                     )
-                    
-                    if st.session_state.general_summary_clicked:
-                        with st.spinner("Generating general summary..."):
-                            # Check if summary already exists in session state
-                            if 'general_summary' not in st.session_state.summaries:
-                                general_summary = generate_summary(transcription, "general")
-                                if general_summary:
-                                    st.session_state.summaries['general_summary'] = general_summary
-                            st.session_state.general_summary_clicked = False  # Reset for next time
-                            
-                            # Display the summary
-                            if 'general_summary' in st.session_state.summaries:
-                                summary_container.markdown("### General Summary")
-                                summary_container.markdown(
-                                    f"<div class='summary-container'>{st.session_state.summaries['general_summary']}</div>", 
-                                    unsafe_allow_html=True
-                                )
-                                
-                                # Add download button for general summary
-                                get_text_download_link(
-                                    st.session_state.summaries['general_summary'],
-                                    "general_summary.txt",
-                                    "📥 Download General Summary"
-                                )
-                                
-                                # Display the meeting evaluation if available
-                                if 'meeting_evaluation' in st.session_state.summaries:
-                                    st.markdown("### Meeting Evaluation (Claude 3.7)")
-                                    formatted_evaluation = format_meeting_evaluation(st.session_state.summaries['meeting_evaluation'])
-                                    st.markdown(
-                                        f"<div class='evaluation-container'>{formatted_evaluation}</div>", 
+                                    
+                                    # Display the meeting evaluation if available
+                                    if 'meeting_evaluation' in st.session_state.summaries:
+                                        st.markdown("### Meeting Evaluation (Claude 3.7)")
+                                        formatted_evaluation = format_meeting_evaluation(st.session_state.summaries['meeting_evaluation'])
+                                        st.markdown(
+                                            f"<div class='evaluation-container'>{formatted_evaluation}</div>", 
+                                            unsafe_allow_html=True
+                                        )
+                                        
+                                        # Add download button for evaluation
+                                        get_text_download_link(
+                                            st.session_state.summaries['meeting_evaluation'],
+                                            "meeting_evaluation.txt",
+                                            "📥 Download Meeting Evaluation"
+                                        )
+                                elif 'general_summary' in st.session_state.summaries:
+                                    summary_container.markdown("### General Summary")
+                                    summary_container.markdown(
+                                        f"<div class='summary-container'>{st.session_state.summaries['general_summary']}</div>", 
                                         unsafe_allow_html=True
                                     )
                                     
-                                    # Add download button for evaluation
+                                    # Add download button for general summary from previous run
                                     get_text_download_link(
-                                        st.session_state.summaries['meeting_evaluation'],
-                                        "meeting_evaluation.txt",
-                                        "📥 Download Meeting Evaluation"
+                                        st.session_state.summaries['general_summary'],
+                                        "general_summary.txt",
+                                        "📥 Download General Summary"
                                     )
-                    
-                    # Check if we have any summaries from previous runs to display
-                    if not st.session_state.meeting_summary_clicked and not st.session_state.general_summary_clicked:
-                        if 'meeting_summary' in st.session_state.summaries:
-                            summary_container.markdown("### Meeting Summary")
-                            # Apply formatting to the meeting summary
-                            formatted_summary = format_meeting_summary(st.session_state.summaries['meeting_summary'])
-                            summary_container.markdown(
-                                f"<div class='summary-container'>{formatted_summary}</div>", 
-                                unsafe_allow_html=True
-                            )
+                                    
+                                    # Display the meeting evaluation if available
+                                    if 'meeting_evaluation' in st.session_state.summaries:
+                                        st.markdown("### Meeting Evaluation (Claude 3.7)")
+                                        formatted_evaluation = format_meeting_evaluation(st.session_state.summaries['meeting_evaluation'])
+                                        st.markdown(
+                                            f"<div class='evaluation-container'>{formatted_evaluation}</div>", 
+                                            unsafe_allow_html=True
+                                        )
+                                        
+                                        # Add download button for evaluation
+                                        get_text_download_link(
+                                            st.session_state.summaries['meeting_evaluation'],
+                                            "meeting_evaluation.txt",
+                                            "📥 Download Meeting Evaluation"
+                                        )
                             
-                            # Add download button for meeting summary from previous run
-                            get_text_download_link(
-                                st.session_state.summaries['meeting_summary'],
-                                "meeting_summary.txt",
-                                "📥 Download Meeting Summary"
-                            )
-                            
-                            # Display the meeting evaluation if available
-                            if 'meeting_evaluation' in st.session_state.summaries:
-                                st.markdown("### Meeting Evaluation (Claude 3.7)")
-                                formatted_evaluation = format_meeting_evaluation(st.session_state.summaries['meeting_evaluation'])
-                                st.markdown(
-                                    f"<div class='evaluation-container'>{formatted_evaluation}</div>", 
-                                    unsafe_allow_html=True
-                                )
-                                
-                                # Add download button for evaluation
-                                get_text_download_link(
-                                    st.session_state.summaries['meeting_evaluation'],
-                                    "meeting_evaluation.txt",
-                                    "📥 Download Meeting Evaluation"
-                                )
-                        elif 'general_summary' in st.session_state.summaries:
-                            summary_container.markdown("### General Summary")
-                            summary_container.markdown(
-                                f"<div class='summary-container'>{st.session_state.summaries['general_summary']}</div>", 
-                                unsafe_allow_html=True
-                            )
-                            
-                            # Add download button for general summary from previous run
-                            get_text_download_link(
-                                st.session_state.summaries['general_summary'],
-                                "general_summary.txt",
-                                "📥 Download General Summary"
-                            )
-                            
-                            # Display the meeting evaluation if available
-                            if 'meeting_evaluation' in st.session_state.summaries:
-                                st.markdown("### Meeting Evaluation (Claude 3.7)")
-                                formatted_evaluation = format_meeting_evaluation(st.session_state.summaries['meeting_evaluation'])
-                                st.markdown(
-                                    f"<div class='evaluation-container'>{formatted_evaluation}</div>", 
-                                    unsafe_allow_html=True
-                                )
-                                
-                                # Add download button for evaluation
-                                get_text_download_link(
-                                    st.session_state.summaries['meeting_evaluation'],
-                                    "meeting_evaluation.txt",
-                                    "📥 Download Meeting Evaluation"
-                                )
-                    
-                    # Clean up temporary file
-                    os.unlink(audio_file_path)
+                            # Clean up temporary file
+                            os.unlink(audio_file_path)
+                        else:
+                            st.error("Recording failed. Please check your microphone permissions.")
 
-    with tab2:
+    # Only display real-time tab if we're in a local environment
+    with realtime_tab:
         st.header("Real-time Transcription with GPT-4o")
         st.markdown("Transcribe audio in real-time using OpenAI's Realtime API and gpt-4o-transcribe model")
         
@@ -1401,7 +1484,8 @@ else:  # Main app content
         realtime_transcript_container = st.empty()
         
         if start_button:
-            api_key = os.environ.get("OPENAI_API_KEY")
+            # Get API key from secrets, environment, or user input
+            api_key = get_api_key("OPENAI_API_KEY") or st.session_state.get('openai_api_key')
             if not api_key:
                 st.error("API key is required for real-time transcription")
             else:
@@ -1409,18 +1493,25 @@ else:  # Main app content
                 st.session_state.realtime_transcriber = RealtimeTranscription(api_key)
                 
                 try:
-                    st.session_state.realtime_transcriber.start()
-                    realtime_transcript_container.markdown("<div class='real-time-transcript'>Listening... (WebSocket connection with GPT-4o Transcribe)</div>", unsafe_allow_html=True)
-                    
-                    # Check if connection was successful after a short delay
-                    time.sleep(2)
-                    if not st.session_state.realtime_transcriber.is_connected:
-                        error = st.session_state.realtime_transcriber.get_error() or "Failed to establish WebSocket connection"
-                        st.session_state.ws_error = f"{error}. Please check your API key and try again."
+                    success = st.session_state.realtime_transcriber.start()
+                    if success:
+                        realtime_transcript_container.markdown("<div class='real-time-transcript'>Listening... (WebSocket connection with GPT-4o Transcribe)</div>", unsafe_allow_html=True)
+                        
+                        # Check if connection was successful after a short delay
+                        time.sleep(2)
+                        if not st.session_state.realtime_transcriber.is_connected:
+                            error = st.session_state.realtime_transcriber.get_error() or "Failed to establish WebSocket connection"
+                            st.session_state.ws_error = f"{error}. Please check your API key and try again."
+                            st.session_state.realtime_streaming = False
+                            st.session_state.realtime_transcriber.stop()
+                            st.session_state.realtime_transcriber = None
+                            st.rerun()
+                    else:
+                        # Get the error from the transcriber
+                        error = st.session_state.realtime_transcriber.get_error() or "Failed to start real-time transcription"
+                        st.error(error)
                         st.session_state.realtime_streaming = False
-                        st.session_state.realtime_transcriber.stop()
                         st.session_state.realtime_transcriber = None
-                        st.rerun()
                 except Exception as e:
                     st.session_state.ws_error = str(e)
                     st.session_state.realtime_streaming = False
@@ -1570,7 +1661,8 @@ else:  # Main app content
             time.sleep(0.5)  # Brief pause
             st.rerun()
 
-    with tab3:
+    # File upload tab (available in all environments)
+    with file_tab:
         st.header("Upload Audio File")
         st.markdown("Upload an MP3 or MP4 file for transcription or translation")
         
@@ -1712,7 +1804,7 @@ else:  # Main app content
                             # Generate meeting summary with Claude
                             with st.spinner("Generating meeting summary with Claude 3.7..."):
                                 # Check if Claude API key is available before attempting to generate summary
-                                if not os.environ.get("CLAUDE_API_KEY"):
+                                if not get_api_key("CLAUDE_API_KEY"):
                                     st.warning("Claude API key is required. Please enter it in the sidebar.")
                                 else:
                                     claude_meeting_summary = generate_claude_summary(transcription, "meeting")
@@ -1734,7 +1826,7 @@ else:  # Main app content
                             # Generate general summary with Claude
                             with st.spinner("Generating general summary with Claude 3.7..."):
                                 # Check if Claude API key is available before attempting to generate summary
-                                if not os.environ.get("CLAUDE_API_KEY"):
+                                if not get_api_key("CLAUDE_API_KEY"):
                                     st.warning("Claude API key is required. Please enter it in the sidebar.")
                                 else:
                                     claude_general_summary = generate_claude_summary(transcription, "general")
@@ -1755,7 +1847,7 @@ else:  # Main app content
                             # Automatically generate meeting evaluation with Claude
                             with st.spinner("Generating meeting evaluation with Claude 3.7..."):
                                 # Check if Claude API key is available
-                                if not os.environ.get("CLAUDE_API_KEY"):
+                                if not get_api_key("CLAUDE_API_KEY"):
                                     st.warning("Claude API key is required. Please enter it in the sidebar.")
                                 else:
                                     # Generate evaluation
@@ -1814,29 +1906,66 @@ else:  # Main app content
 # Sidebar info
 with st.sidebar:
     st.markdown("## About")
+    
+    # Add environment indicator
+    if is_cloud_env:
+        st.info("📡 **Cloud Environment Detected**\nRunning on Streamlit Cloud - microphone access is disabled.")
+    else:
+        st.success("🖥️ **Local Environment Detected**\nAll features are available.")
+    
     st.markdown("""
     This app uses OpenAI's speech recognition technology to transcribe and translate audio.
     
     ### Available Models:
-    - **Whisper-1**: OpenAI's standard speech recognition model (for file upload)
+    - **Whisper-1**: OpenAI's standard speech recognition model
       - Supports both transcription and translation to English
-      - Handles large files (>500MB) by automatically splitting into smaller chunks
+      - Handles large files (>24.5MB) by automatically splitting into smaller chunks
       - Memory-efficient processing for very large audio files
     - **GPT-4o Transcribe**: Latest model with real-time capabilities
     - **GPT-4o Transcribe Mini**: Lighter and faster real-time transcription model
     - **Claude 3 Sonnet**: Used for generating alternative AI summaries when the Claude option is selected
     
     ### Features:
-    - Record audio via microphone
-    - Real-time streaming transcription with WebSockets
-    - Upload audio files for transcription
-    - Translate non-English audio to English text
-    - Process large audio files by automatically splitting them
-    - Generate meeting summaries with multiple AI models
-    
-    ### Technical Details:
-    The real-time transcription uses OpenAI's Realtime API with WebSockets to process audio streams as you speak, providing instant transcription using the GPT-4o Transcribe model.
     """)
+    
+    # Display feature availability based on environment
+    if not is_cloud_env and AUDIO_RECORDING_AVAILABLE:
+        st.markdown("""
+        ✅ Record audio via microphone
+        ✅ Real-time streaming transcription with WebSockets
+        ✅ Upload audio files for transcription
+        ✅ Translate non-English audio to English text
+        ✅ Process large audio files by automatically splitting them
+        ✅ Generate meeting summaries with multiple AI models
+        """)
+    else:
+        st.markdown("""
+        ❌ Record audio via microphone (unavailable in cloud)
+        ❌ Real-time streaming transcription (unavailable in cloud)
+        ✅ Upload audio files for transcription
+        ✅ Translate non-English audio to English text
+        ✅ Process large audio files by automatically splitting them
+        ✅ Generate meeting summaries with multiple AI models
+        """)
+    
+    st.markdown("""
+    ### Technical Details:
+    The real-time transcription uses OpenAI's Realtime API with WebSockets to process audio streams as you speak, providing instant transcription using the GPT-4o Transcribe model. This feature requires a local environment with audio hardware.
+    
+    File upload works in all environments, including Streamlit Cloud.
+    """)
+
+# Add additional note about deployment constraints
+if is_cloud_env:
+    st.markdown("""
+    <div style='background-color: #FFF3CD; color: #856404; padding: 15px; border-radius: 5px; margin: 10px 0; border-left: 5px solid #FFECB5;'>
+        <h3 style='margin-top: 0;'>⚠️ Cloud Deployment Notice</h3>
+        <p>This app is running on Streamlit Cloud, which doesn't support audio hardware access.</p>
+        <p><strong>Limited functionality:</strong> Microphone recording and real-time transcription are disabled.</p>
+        <p><strong>Available features:</strong> File upload, transcription, translation, and summary generation with GPT-4 and Claude 3.7 remain fully functional.</p>
+        <p>For full functionality including microphone access, run this app locally.</p>
+    </div>
+    """, unsafe_allow_html=True)
 
 # Footer
 st.markdown("---")
