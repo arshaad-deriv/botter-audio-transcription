@@ -1935,198 +1935,199 @@ else:  # Main app content
                             st.error("Recording failed. Please check your microphone permissions.")
 
     # Only display real-time tab if we're in a local environment
-    with realtime_tab:
-        st.header("Enhanced Real-time Transcription")
-        st.markdown("Transcribe and translate audio in real-time with chunked processing")
-        
-        # Initialize session state for chunked streaming
-        if 'chunked_streaming' not in st.session_state:
-            st.session_state.chunked_streaming = False
-            st.session_state.audio_processor = None
-        
-        # Display any connection errors
-        if 'realtime_error' in st.session_state and st.session_state.realtime_error:
-            st.error(f"Error: {st.session_state.realtime_error}")
-            st.session_state.realtime_error = None
-        
-        # Add debug checkbox for testing
-        show_debug_realtime = st.checkbox("Debug mode (shows more info)", value=False, 
-                               help="Enable this for troubleshooting connection issues", key="debug_new_realtime")
-        
-        # Add translation toggle
-        show_translation = st.checkbox("Enable automatic translation", value=True,
-                            help="Automatically translate non-English speech to English")
-        
-        # Start/Stop streaming buttons
-        col1, col2 = st.columns(2)
-        with col1:
-            start_button = st.button("Start Streaming", type="primary", 
-                                    disabled=st.session_state.chunked_streaming, 
-                                    key="start_chunked_realtime")
-        with col2:
-            stop_button = st.button("Stop Streaming", type="secondary", 
-                                   disabled=not st.session_state.chunked_streaming, 
-                                   key="stop_chunked_realtime")
-        
-        # Create placeholders for transcript and translation
-        realtime_transcript_container = st.empty()
-        realtime_translation_container = st.empty()
-        
-        if start_button:
-            # Get API key from secrets, environment, or user input
-            api_key = get_api_key("OPENAI_API_KEY") or st.session_state.get('openai_api_key')
-            if not api_key:
-                st.error("API key is required for real-time transcription")
-            else:
-                try:
-                    # Initialize audio processor
-                    st.session_state.audio_processor = ChunkedAudioProcessor(api_key)
-                    st.session_state.chunked_streaming = True
-                    
-                    # Set up audio stream with sounddevice
-                    if not AUDIO_RECORDING_AVAILABLE or sd is None:
-                        st.error("Microphone recording is not available in this environment")
-                    else:
-                        # Audio callback function for streaming
-                        def audio_callback(indata, frames, time_info, status):
-                            """Callback to capture audio data from microphone"""
-                            if status:
-                                print(f"Audio status: {status}")
+    if not is_cloud_env and AUDIO_RECORDING_AVAILABLE:
+        with realtime_tab:
+            st.header("Enhanced Real-time Transcription")
+            st.markdown("Transcribe and translate audio in real-time with chunked processing")
+            
+            # Initialize session state for chunked streaming
+            if 'chunked_streaming' not in st.session_state:
+                st.session_state.chunked_streaming = False
+                st.session_state.audio_processor = None
+            
+            # Display any connection errors
+            if 'realtime_error' in st.session_state and st.session_state.realtime_error:
+                st.error(f"Error: {st.session_state.realtime_error}")
+                st.session_state.realtime_error = None
+            
+            # Add debug checkbox for testing
+            show_debug_realtime = st.checkbox("Debug mode (shows more info)", value=False, 
+                                   help="Enable this for troubleshooting connection issues", key="debug_new_realtime")
+            
+            # Add translation toggle
+            show_translation = st.checkbox("Enable automatic translation", value=True,
+                                help="Automatically translate non-English speech to English")
+            
+            # Start/Stop streaming buttons
+            col1, col2 = st.columns(2)
+            with col1:
+                start_button = st.button("Start Streaming", type="primary", 
+                                        disabled=st.session_state.chunked_streaming, 
+                                        key="start_chunked_realtime")
+            with col2:
+                stop_button = st.button("Stop Streaming", type="secondary", 
+                                       disabled=not st.session_state.chunked_streaming, 
+                                       key="stop_chunked_realtime")
+            
+            # Create placeholders for transcript and translation
+            realtime_transcript_container = st.empty()
+            realtime_translation_container = st.empty()
+            
+            if start_button:
+                # Get API key from secrets, environment, or user input
+                api_key = get_api_key("OPENAI_API_KEY") or st.session_state.get('openai_api_key')
+                if not api_key:
+                    st.error("API key is required for real-time transcription")
+                else:
+                    try:
+                        # Initialize audio processor
+                        st.session_state.audio_processor = ChunkedAudioProcessor(api_key)
+                        st.session_state.chunked_streaming = True
+                        
+                        # Set up audio stream with sounddevice
+                        if not AUDIO_RECORDING_AVAILABLE or sd is None:
+                            st.error("Microphone recording is not available in this environment")
+                        else:
+                            # Audio callback function for streaming
+                            def audio_callback(indata, frames, time_info, status):
+                                """Callback to capture audio data from microphone"""
+                                if status:
+                                    print(f"Audio status: {status}")
+                                
+                                # Convert float32 audio data to int16
+                                audio_data = (indata * 32767).astype(np.int16).tobytes()
+                                
+                                # Add to processor
+                                if st.session_state.audio_processor:
+                                    st.session_state.audio_processor.add_audio_chunk(audio_data)
                             
-                            # Convert float32 audio data to int16
-                            audio_data = (indata * 32767).astype(np.int16).tobytes()
+                            # Start stream
+                            stream = sd.InputStream(
+                                samplerate=16000,
+                                channels=1,
+                                callback=audio_callback
+                            )
+                            stream.start()
                             
-                            # Add to processor
-                            if st.session_state.audio_processor:
-                                st.session_state.audio_processor.add_audio_chunk(audio_data)
-                        
-                        # Start stream
-                        stream = sd.InputStream(
-                            samplerate=16000,
-                            channels=1,
-                            callback=audio_callback
-                        )
-                        stream.start()
-                        
-                        # Store stream in session state
-                        st.session_state.audio_stream = stream
-                        
-                        realtime_transcript_container.markdown(
-                            "<div class='real-time-transcript'>Listening... (Chunked processing active)</div>", 
-                            unsafe_allow_html=True
-                        )
-                        
+                            # Store stream in session state
+                            st.session_state.audio_stream = stream
+                            
+                            realtime_transcript_container.markdown(
+                                "<div class='real-time-transcript'>Listening... (Chunked processing active)</div>", 
+                                unsafe_allow_html=True
+                            )
+                            
+                            if show_debug_realtime:
+                                st.success("Audio streaming started successfully!")
+                
+                    except Exception as e:
+                        st.session_state.realtime_error = str(e)
+                        st.session_state.chunked_streaming = False
+                        st.session_state.audio_processor = None
                         if show_debug_realtime:
-                            st.success("Audio streaming started successfully!")
-                
-                except Exception as e:
-                    st.session_state.realtime_error = str(e)
-                    st.session_state.chunked_streaming = False
-                    st.session_state.audio_processor = None
-                    if show_debug_realtime:
-                        st.error(f"Exception details: {e}")
-                    st.rerun()
-                
-                # Rerun to update UI state
-                st.rerun()
-        
-        if stop_button and st.session_state.chunked_streaming:
-            if 'audio_stream' in st.session_state and st.session_state.audio_stream:
-                st.session_state.audio_stream.stop()
-                st.session_state.audio_stream.close()
-                
-            # Get final transcript and translation
-            final_transcript = ""
-            final_translation = ""
-            detected_language = "Unknown"
-            
-            if st.session_state.audio_processor:
-                final_transcript = st.session_state.audio_processor.get_transcript()
-                final_translation = st.session_state.audio_processor.get_translation()
-                detected_language = st.session_state.audio_processor.get_language()
-            
-            # Display final transcript
-            if final_transcript:
-                realtime_transcript_container.markdown(
-                    f"<div class='real-time-transcript'>{final_transcript}</div>", 
-                    unsafe_allow_html=True
-                )
-                
-                # Add download button for real-time transcription
-                get_text_download_link(
-                    final_transcript,
-                    "realtime_transcription.txt",
-                    "📥 Download Transcription"
-                )
-                
-                # Display language detection and translation if available
-                if detected_language != "Unknown":
-                    st.info(f"Detected language: {detected_language}")
+                            st.error(f"Exception details: {e}")
+                        st.rerun()
                     
-                    if detected_language != "English" and final_translation:
-                        realtime_translation_container.markdown(
-                            f"<div class='translation-container'>{final_translation}</div>", 
-                            unsafe_allow_html=True
-                        )
-                        
-                        # Add download button for translation
-                        get_text_download_link(
-                            final_translation,
-                            "realtime_translation.txt",
-                            "📥 Download Translation"
-                        )
+                    # Rerun to update UI state
+                    st.rerun()
+            
+            if stop_button and st.session_state.chunked_streaming:
+                if 'audio_stream' in st.session_state and st.session_state.audio_stream:
+                    st.session_state.audio_stream.stop()
+                    st.session_state.audio_stream.close()
+                    
+                # Get final transcript and translation
+                final_transcript = ""
+                final_translation = ""
+                detected_language = "Unknown"
                 
-                # Store in session state for summary generation
-                st.session_state.rt_transcription = final_transcript
-            
-            # Reset session state
-            st.session_state.chunked_streaming = False
-            st.session_state.audio_processor = None
-            
-            # Success message
-            st.success("Transcription completed!")
-            
-            # Show summary options after stopping
-            if final_transcript:
-                # Add summary options
-                st.markdown("### Generate Summary")
-                # [Summary options code as before]
-            
-            # Rerun to update UI state
-            st.rerun()
-        
-        # Update the transcript in real-time if streaming
-        if st.session_state.chunked_streaming and st.session_state.audio_processor:
-            # Get current transcript and translation
-            current_transcript = st.session_state.audio_processor.get_transcript()
-            current_translation = st.session_state.audio_processor.get_translation()
-            current_language = st.session_state.audio_processor.get_language()
-            
-            # Update transcript display
-            if current_transcript:
-                realtime_transcript_container.markdown(
-                    f"<div class='real-time-transcript'>{current_transcript}</div>", 
-                    unsafe_allow_html=True
-                )
+                if st.session_state.audio_processor:
+                    final_transcript = st.session_state.audio_processor.get_transcript()
+                    final_translation = st.session_state.audio_processor.get_translation()
+                    detected_language = st.session_state.audio_processor.get_language()
                 
-                # Show translation if available and enabled
-                if show_translation and current_language not in ["English", "Unknown"] and current_translation:
-                    realtime_translation_container.markdown(
-                        f"<div class='translation-container'>{current_translation}</div>", 
+                # Display final transcript
+                if final_transcript:
+                    realtime_transcript_container.markdown(
+                        f"<div class='real-time-transcript'>{final_transcript}</div>", 
                         unsafe_allow_html=True
                     )
                     
-                    # Show detected language in debug mode
-                    if show_debug_realtime:
-                        st.info(f"Detected language: {current_language}")
+                    # Add download button for real-time transcription
+                    get_text_download_link(
+                        final_transcript,
+                        "realtime_transcription.txt",
+                        "📥 Download Transcription"
+                    )
+                    
+                    # Display language detection and translation if available
+                    if detected_language != "Unknown":
+                        st.info(f"Detected language: {detected_language}")
+                        
+                        if detected_language != "English" and final_translation:
+                            realtime_translation_container.markdown(
+                                f"<div class='translation-container'>{final_translation}</div>", 
+                                unsafe_allow_html=True
+                            )
+                            
+                            # Add download button for translation
+                            get_text_download_link(
+                                final_translation,
+                                "realtime_translation.txt",
+                                "📥 Download Translation"
+                            )
+                    
+                    # Store in session state for summary generation
+                    st.session_state.rt_transcription = final_transcript
+                
+                # Reset session state
+                st.session_state.chunked_streaming = False
+                st.session_state.audio_processor = None
+                
+                # Success message
+                st.success("Transcription completed!")
+                
+                # Show summary options after stopping
+                if final_transcript:
+                    # Add summary options
+                    st.markdown("### Generate Summary")
+                    # [Summary options code as before]
+                
+                # Rerun to update UI state
+                st.rerun()
             
-            # Show debug info if enabled
-            if show_debug_realtime:
-                st.info(f"Audio chunk size: {st.session_state.audio_processor.chunk_duration_ms}ms | Processing active: {st.session_state.audio_processor.is_processing}")
-            
-            # Add automatic rerun for real-time updates
-            time.sleep(0.3)  # Brief pause (shorter than chunk size)
-            st.rerun()
+            # Update the transcript in real-time if streaming
+            if st.session_state.chunked_streaming and st.session_state.audio_processor:
+                # Get current transcript and translation
+                current_transcript = st.session_state.audio_processor.get_transcript()
+                current_translation = st.session_state.audio_processor.get_translation()
+                current_language = st.session_state.audio_processor.get_language()
+                
+                # Update transcript display
+                if current_transcript:
+                    realtime_transcript_container.markdown(
+                        f"<div class='real-time-transcript'>{current_transcript}</div>", 
+                        unsafe_allow_html=True
+                    )
+                    
+                    # Show translation if available and enabled
+                    if show_translation and current_language not in ["English", "Unknown"] and current_translation:
+                        realtime_translation_container.markdown(
+                            f"<div class='translation-container'>{current_translation}</div>", 
+                            unsafe_allow_html=True
+                        )
+                        
+                        # Show detected language in debug mode
+                        if show_debug_realtime:
+                            st.info(f"Detected language: {current_language}")
+                
+                # Show debug info if enabled
+                if show_debug_realtime:
+                    st.info(f"Audio chunk size: {st.session_state.audio_processor.chunk_duration_ms}ms | Processing active: {st.session_state.audio_processor.is_processing}")
+                
+                # Add automatic rerun for real-time updates
+                time.sleep(0.3)  # Brief pause (shorter than chunk size)
+                st.rerun()
 
     # File upload tab (available in all environments)
     with file_tab:
