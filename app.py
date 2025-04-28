@@ -20,7 +20,6 @@ import sys
 import platform
 import tempfile
 import time
-from dotenv import load_dotenv
 import base64
 import queue
 import threading
@@ -29,6 +28,7 @@ import json
 import math
 import requests
 import wave  # Add this import at the top with other imports
+import re
 
 # Detect if running in Streamlit Cloud
 is_cloud_env = os.environ.get('STREAMLIT_RUNTIME_IS_STREAMLIT_CLOUD') == 'true' or 'HOSTNAME' in os.environ
@@ -62,7 +62,7 @@ import struct
 from moviepy.editor import VideoFileClip  # For MP4 to MP3 conversion
 
 # Load environment variables (for local development with .env file)
-load_dotenv()
+# load_dotenv()
 
 # Function to get API keys from Streamlit secrets or environment variables with fallback to user input
 def get_api_key(key_name):
@@ -819,21 +819,38 @@ def generate_claude_summary(text, summary_type):
         claude_client = anthropic.Anthropic(api_key=claude_key)
         
         if summary_type == "meeting":
-            system_prompt = """You are a professional meeting summarizer specialized in creating structured, concise summaries of conversations and meetings.
-            Your summaries should highlight the key points, decisions made, action items, and next steps discussed.
-            Present your summary in a structured format with the following sections:
+            system_prompt = """You are an experienced journalist at The New York Times."""
             
-            - Overall Summary: A brief 2-3 sentence overview of what the meeting was about
-            - Completed: Items/tasks reported as completed
-            - Ongoing: Tasks/projects currently in progress
-            - Blockers: Any obstacles or issues mentioned
-            - Ideas Discussed: Key concepts or suggestions that were brought up
-            - To Do: Specific action items and who they're assigned to
-            - Action Points We Need to Start as a Team
-            
-            Make sure to format each section with appropriate bullet points and include names of people mentioned for action items when available. If a particular section has no content, indicate "None mentioned" under that heading."""
-            
-            user_prompt = f"Please summarize the following meeting transcript in a structured format highlighting key points, decisions and action items:\n\n{text}"
+            user_prompt = f"""Analyze the following meeting transcript and rewrite it into a series of news headlines and corresponding subheadlines (decks) that reflect the publication's editorial standards while highlighting key aspects of the meeting.
+<meeting_transcript>
+{text}
+</meeting_transcript>
+After carefully reading the transcript, create headlines and subheadlines for each of the following elements:
+
+1. A masthead with the following
+Title: THE MEETING NEWS
+Subtitle: A headline for the meeting
+2. Main Story: Capture the meeting's purpose and outcome.
+3. The Good: Highlight positive accomplishments, KPIs, or metrics worth escalating.
+4. The Bad: Address neutral or somewhat negative issues, KPIs, or metrics worth escalating.
+5. The Ugly: Focus on serious or high-risk issues, including KPIs, metrics, blockers, or other issues worth escalating.
+6. Issues Discussed: Cover each significant topic discussed in the meeting.
+7. Key Decisions: Highlight explicit decisions reached during the meeting.
+8. Assigned Actions: Detail specific tasks assigned, including who they were assigned to and timelines if mentioned.
+9. Questions & Issues Raised:
+a. Key questions raised and clearly resolved
+b. Key questions raised but left unresolved or open
+c. Key questions that should have been raised but were not
+10. Blockers & Challenges: Highlight obstacles, blockers, or hard challenges raised.
+11. Follow-up Discussions & Check-ins: Mention any follow-up discussions or check-ins, including dates and objectives.
+12. Key People Referenced: List individuals mentioned (including non-attendees) and their roles if stated. Only include people explicitly mentioned in the meeting. Do not make up implied names for those not mentioned.
+For each element:
+13. Extract Key Stories: Identify the most newsworthy elements within the text.
+14. Craft Headlines: For each key story, write a concise, informative headline that captures the essence of the news. Use clear and formal language, adhering to The New York Times' style.
+15. Write Subheadlines (Decks): Below each headline, provide a subheadline that offers additional context or details, maintaining the same journalistic tone.
+Ensure your writing maintains journalistic integrity by prioritizing accuracy, neutrality, and clarity. Avoid sensationalism and maintain the objective tone characteristic of The New York Times.
+Format your output as a list of headline and subheadline pairs suitable for publication on The New York Times' homepage.
+Your final answer should only include the formatted list of headlines and subheadlines, organized under the categories mentioned above. Do not include any additional commentary or explanations outside of the requested format."""
             
         else:  # general summary
             system_prompt = """You are a professional content summarizer capable of condensing spoken text into clear, concise summaries.
@@ -845,7 +862,7 @@ def generate_claude_summary(text, summary_type):
         # Call Claude API
         response = claude_client.messages.create(
             model="claude-3-7-sonnet-latest",
-            max_tokens=4000,
+            max_tokens=50000,  # Increased from 4000 to 50000
             temperature=0.3,
             system=system_prompt,
             messages=[
@@ -862,6 +879,109 @@ def generate_claude_summary(text, summary_type):
         st.error(f"Error generating Claude summary: {str(e)}")
         print(f"Claude API error: {str(e)}")
         return None
+
+# New function to format the New York Times style headlines
+def format_nyt_summary(summary_text):
+    # Format the NYT style headline summary
+    formatted_text = summary_text
+    
+    # Add category styling for each section
+    section_titles = {
+        "THE MEETING NEWS": "<div class='nyt-masthead'>📰 THE MEETING NEWS</div>",
+        "Main Story:": "<div class='nyt-section'>📑 MAIN STORY</div>",
+        "The Good:": "<div class='nyt-section'>✅ THE GOOD</div>",
+        "The Bad:": "<div class='nyt-section'>⚠️ THE BAD</div>",
+        "The Ugly:": "<div class='nyt-section'>🚫 THE UGLY</div>",
+        "Issues Discussed:": "<div class='nyt-section'>💬 ISSUES DISCUSSED</div>",
+        "Key Decisions:": "<div class='nyt-section'>🔑 KEY DECISIONS</div>",
+        "Assigned Actions:": "<div class='nyt-section'>📋 ASSIGNED ACTIONS</div>",
+        "Questions & Issues Raised:": "<div class='nyt-section'>❓ QUESTIONS & ISSUES RAISED</div>",
+        "Blockers & Challenges:": "<div class='nyt-section'>🚧 BLOCKERS & CHALLENGES</div>",
+        "Follow-up Discussions & Check-ins:": "<div class='nyt-section'>📅 FOLLOW-UP DISCUSSIONS</div>",
+        "Key People Referenced:": "<div class='nyt-section'>👥 KEY PEOPLE REFERENCED</div>"
+    }
+    
+    for original, styled in section_titles.items():
+        formatted_text = formatted_text.replace(original, styled)
+    
+    # Format headlines and subheadlines
+    lines = formatted_text.split("\n")
+    result_lines = []
+    
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        
+        # Skip empty lines
+        if not stripped:
+            result_lines.append(line)
+            continue
+            
+        # Check if this line is a headline
+        is_headline = False
+        
+        # Headlines typically start with numbers or letters followed by period/colon
+        if re.match(r'^[a-zA-Z0-9][a-zA-Z0-9]?[\.\:)]', stripped) or stripped.startswith("- "):
+            is_headline = True
+            
+        # Format headline
+        if is_headline:
+            # Remove the bullet or numbering
+            headline_text = re.sub(r'^[a-zA-Z0-9][a-zA-Z0-9]?[\.\:)] ', '', stripped)
+            headline_text = re.sub(r'^- ', '', headline_text)
+            
+            # Wrap headline in styled div
+            result_lines.append(f"<div class='nyt-headline'>{headline_text}</div>")
+            
+            # Check if next line is a subheadline (non-empty and not a new headline)
+            if i+1 < len(lines) and lines[i+1].strip() and not re.match(r'^[a-zA-Z0-9][a-zA-Z0-9]?[\.\:)]', lines[i+1].strip()) and not lines[i+1].strip().startswith("- "):
+                # It's a subheadline
+                subheadline = lines[i+1].strip()
+                result_lines.append(f"<div class='nyt-subheadline'>{subheadline}</div>")
+                # Skip the next line as we've already processed it
+                lines[i+1] = ""
+            
+        # If not a headline and not already processed as a subheadline
+        elif stripped:
+            result_lines.append(line)
+    
+    formatted_text = "\n".join(result_lines)
+    
+    # Add custom CSS for newspaper styling
+    st.markdown("""
+    <style>
+    .nyt-masthead {
+        font-family: 'Georgia', serif;
+        font-size: 2.5em;
+        font-weight: bold;
+        text-align: center;
+        margin: 20px 0 5px 0;
+        border-bottom: 2px solid #000;
+        padding-bottom: 5px;
+    }
+    .nyt-section {
+        font-family: 'Georgia', serif;
+        font-size: 1.5em;
+        font-weight: bold;
+        margin: 25px 0 15px 0;
+        border-bottom: 1px solid #ddd;
+        padding-bottom: 5px;
+    }
+    .nyt-headline {
+        font-family: 'Georgia', serif;
+        font-size: 1.2em;
+        font-weight: bold;
+        margin: 15px 0 5px 0;
+    }
+    .nyt-subheadline {
+        font-family: 'Georgia', serif;
+        font-style: italic;
+        color: #555;
+        margin: 0 0 15px 20px;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+    
+    return formatted_text
 
 # Function to format the meeting summary with category styling and proper list handling
 def format_meeting_summary(summary_text):
@@ -2317,11 +2437,11 @@ else:  # Main app content
                     
                     # Create tabs for GPT and Claude summaries
                     if use_claude:
-                        summary_tabs = st.tabs(["o3-mini Summary", "Claude 3.7 Summary", "Meeting Evaluation"])
+                        summary_tabs = st.tabs(["GPT4.1 Summary", "Claude 3.7 Summary", "Meeting Evaluation"])
                         
                         with summary_tabs[0]:
                             # Automatically generate meeting summary with GPT
-                            with st.spinner("Generating meeting summary with GPT-4o Mini..."):
+                            with st.spinner("Generating meeting summary with GPT-4.1 ..."):
                                 meeting_summary = generate_summary(transcription, "meeting")
                                 if meeting_summary:
                                     st.markdown("### Meeting Summary (GPT-4o Mini)")
@@ -2361,7 +2481,7 @@ else:  # Main app content
                                     if claude_meeting_summary:
                                         st.markdown("### Meeting Summary (Claude 3.7)")
                                         # Apply formatting to the Claude meeting summary
-                                        formatted_claude_summary = format_meeting_summary(claude_meeting_summary)
+                                        formatted_claude_summary = format_nyt_summary(claude_meeting_summary)
                                         st.markdown(f"<div class='summary-container'>{formatted_claude_summary}</div>", unsafe_allow_html=True)
                                         
                                         # Add download button for Claude meeting summary
