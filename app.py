@@ -862,7 +862,7 @@ Your final answer should only include the formatted list of headlines and subhea
         # Call Claude API
         response = claude_client.messages.create(
             model="claude-3-7-sonnet-latest",
-            max_tokens=20000,  # Increased from 4000 to 20000
+            max_tokens=20000,  # Increased from 4000 to 50000
             temperature=0.3,
             system=system_prompt,
             messages=[
@@ -2639,5 +2639,5 @@ if is_cloud_env:
 
 # Footer
 st.markdown("---")
-st.markdown("Built with Streamlit and OpenAI's speech recognition technology")
+st.markdown("Built with Streamlit and OpenAI's speech recognition technology | [Privacy Policy](/privacy)", unsafe_allow_html=True)
 
