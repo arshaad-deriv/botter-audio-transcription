@@ -862,7 +862,7 @@ Your final answer should only include the formatted list of headlines and subhea
         # Call Claude API
         response = claude_client.messages.create(
             model="claude-3-7-sonnet-latest",
-            max_tokens=50000,  # Increased from 4000 to 50000
+            max_tokens=20000,  # Increased from 4000 to 20000
             temperature=0.3,
             system=system_prompt,
             messages=[
