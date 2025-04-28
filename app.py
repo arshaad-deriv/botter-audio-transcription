@@ -27,6 +27,8 @@ import threading
 import io
 import json
 import math
+import requests
+import wave  # Add this import at the top with other imports
 
 # Detect if running in Streamlit Cloud
 is_cloud_env = os.environ.get('STREAMLIT_RUNTIME_IS_STREAMLIT_CLOUD') == 'true' or 'HOSTNAME' in os.environ
@@ -173,13 +175,13 @@ def split_audio_file(audio_file_path, max_chunk_size_mb=24.5):
             # Extract chunk
             chunk = audio[start_time:end_time]
             
-            # Create temporary file for the chunk
-            temp_chunk_file = tempfile.NamedTemporaryFile(delete=False, suffix=file_extension)
+            # Create temporary file for the chunk - always use mp3 for better compatibility
+            temp_chunk_file = tempfile.NamedTemporaryFile(delete=False, suffix='.mp3')
             chunk_path = temp_chunk_file.name
             temp_chunk_file.close()
             
-            # Export chunk to file
-            chunk.export(chunk_path, format=file_extension.replace('.', ''))
+            # Export chunk to file - always use mp3 format for better compatibility
+            chunk.export(chunk_path, format='mp3')
             
             # Add to list of chunk paths
             chunk_paths.append(chunk_path)
@@ -313,8 +315,14 @@ def extract_audio_from_video(video_file_path):
         seconds = int(duration_seconds % 60)
         duration_formatted = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
         
-        # Write audio to MP3 file
-        audio.write_audiofile(temp_audio_path, codec='mp3', bitrate='192k')
+        # Write audio to MP3 file with additional ffmpeg parameters for better compatibility
+        audio.write_audiofile(
+            temp_audio_path,
+            codec='libmp3lame',  # Explicitly use libmp3lame codec
+            bitrate='192k',
+            ffmpeg_params=['-ac', '1'],  # Convert to mono
+            logger=None  # Suppress ffmpeg output
+        )
         
         # Get file size in MB
         file_size_mb = os.path.getsize(temp_audio_path) / (1024 * 1024)
@@ -346,12 +354,18 @@ class RealtimeTranscription:
     
     def on_message(self, ws, message):
         response = json.loads(message)
-        if "error" in response:
-            self.error_message = response["error"]
-            print(f"WebSocket error: {response['error']}")
+        event_type = response.get("type")
         
-        if "text" in response:
-            self.transcript = response["text"]
+        if event_type == "error":
+            self.error_message = response.get("error")
+            print(f"WebSocket error: {response.get('error')}")
+        
+        elif event_type == "conversation.item.input_audio_transcription.delta":
+            delta = response.get("delta", "")
+            self.transcript += delta
+        
+        elif event_type == "conversation.item.input_audio_transcription.completed":
+            self.transcript = response.get("transcript", self.transcript)
     
     def on_error(self, ws, error):
         self.error_message = str(error)
@@ -397,8 +411,8 @@ class RealtimeTranscription:
                     # Convert audio to base64 and send to WebSocket
                     audio_base64 = base64.b64encode(audio_data).decode('utf-8')
                     payload = json.dumps({
-                        "audio": audio_base64,
-                        "internal": "true"
+                        "type": "input_audio_buffer.append",
+                        "audio": audio_base64
                     })
                     self.ws.send(payload)
                 
@@ -424,27 +438,59 @@ class RealtimeTranscription:
             self.error_message = "Real-time transcription requires microphone access, which is not available in Streamlit Cloud environment."
             return False
 
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json"
-        }
-        
-        # Initialize WebSocket connection
-        self.ws = websocket.WebSocketApp(
-            "wss://online-audio.openai.com/v1/transcribe",
-            header=headers,
-            on_message=self.on_message,
-            on_error=self.on_error,
-            on_close=self.on_close,
-            on_open=self.on_open
-        )
-        
-        # Start WebSocket connection in a background thread
-        self.stop_event.clear()
-        ws_thread = threading.Thread(target=self.ws.run_forever)
-        ws_thread.daemon = True
-        ws_thread.start()
-        return True
+        try:
+            # First create a transcription session via REST API
+            url = "https://api.openai.com/v1/realtime/transcription_sessions"
+            payload = {
+                "input_audio_format": "pcm16",
+                "input_audio_transcription": {
+                    "model": "gpt-4o-mini-transcribe",  # Using mini model here
+                    "language": "en",
+                    "prompt": "Transcribe the incoming audio in real time."
+                },
+                "turn_detection": {"type": "server_vad", "silence_duration_ms": 1000}
+            }
+            headers = {
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+                "OpenAI-Beta": "assistants=v2"
+            }
+            
+            response = requests.post(url, json=payload, headers=headers)
+            if response.status_code != 200:
+                self.error_message = f"Failed to create transcription session: {response.status_code} {response.text}"
+                return False
+                
+            data = response.json()
+            ephemeral_token = data["client_secret"]["value"]
+            
+            # Now connect to WebSocket with ephemeral token
+            headers = {
+                "Authorization": f"Bearer {ephemeral_token}",
+                "OpenAI-Beta": "realtime=v1"
+            }
+            
+            # Initialize WebSocket connection
+            self.ws = websocket.WebSocketApp(
+                "wss://api.openai.com/v1/realtime",
+                header=headers,
+                on_message=self.on_message,
+                on_error=self.on_error,
+                on_close=self.on_close,
+                on_open=self.on_open
+            )
+            
+            # Start WebSocket connection in a background thread
+            self.stop_event.clear()
+            ws_thread = threading.Thread(target=self.ws.run_forever)
+            ws_thread.daemon = True
+            ws_thread.start()
+            return True
+            
+        except Exception as e:
+            self.error_message = str(e)
+            print(f"WebSocket connection error: {e}")
+            return False
     
     def stop(self):
         self.stop_event.set()
@@ -454,10 +500,266 @@ class RealtimeTranscription:
     def get_transcript(self):
         return self.transcript
 
+# New class for handling chunked audio processing
+class ChunkedAudioProcessor:
+    def __init__(self, api_key):
+        self.api_key = api_key
+        self.client = openai.OpenAI(api_key=api_key)
+        self.audio_buffer = b''
+        self.chunk_duration_ms = 600  # 600ms chunks
+        self.sample_rate = 16000
+        self.channels = 1
+        self.transcript = ""
+        self.translation = ""
+        self.is_processing = False
+        self.processing_lock = threading.Lock()
+        self.last_chunk_time = time.time()
+        self.language = "Unknown"
+        
+    def add_audio_chunk(self, audio_data):
+        """Add a chunk of audio data to the buffer"""
+        self.audio_buffer += audio_data
+        current_time = time.time()
+        
+        # Process chunks if we have enough data and not currently processing
+        if len(self.audio_buffer) >= (self.sample_rate * self.channels * 2 * (self.chunk_duration_ms / 1000)) and not self.is_processing:
+            self.is_processing = True
+            chunk_thread = threading.Thread(target=self.process_audio_chunk)
+            chunk_thread.daemon = True
+            chunk_thread.start()
+            self.last_chunk_time = current_time
+    
+    def process_audio_chunk(self):
+        """Process the current audio buffer into transcription and translation"""
+        try:
+            # Create a copy of the buffer and clear the original
+            with self.processing_lock:
+                audio_chunk = self.audio_buffer
+                self.audio_buffer = b''
+            
+            # Save chunk to temporary file
+            temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.wav')
+            temp_file_path = temp_file.name
+            temp_file.close()
+            
+            # Convert raw audio data to WAV file
+            with wave.open(temp_file_path, 'wb') as wf:
+                wf.setnchannels(self.channels)
+                wf.setsampwidth(2)  # 16-bit audio
+                wf.setframerate(self.sample_rate)
+                wf.writeframes(audio_chunk)
+            
+            # Transcribe the audio chunk
+            with open(temp_file_path, 'rb') as audio_file:
+                response = self.client.audio.transcriptions.create(
+                    model="gpt-4o-mini-transcribe",
+                    file=audio_file,
+                    response_format="text"
+                )
+            
+            # Append new transcription
+            chunk_text = response
+            if chunk_text and chunk_text.strip():
+                self.transcript += " " + chunk_text
+                
+                # Detect language if it's still unknown
+                if self.language == "Unknown" and len(self.transcript) > 20:
+                    self.detect_language()
+                
+                # Translate if not English
+                if self.language not in ["English", "Unknown"]:
+                    self.translate_chunk(chunk_text)
+            
+            # Clean up
+            os.unlink(temp_file_path)
+            
+        except Exception as e:
+            print(f"Error processing audio chunk: {e}")
+        finally:
+            self.is_processing = False
+    
+    def detect_language(self):
+        """Detect the language of the transcript"""
+        try:
+            detect_prompt = f"""Determine the language of this text. Just respond with the language name:
+            
+            Text: {self.transcript[:100]}
+            """
+            
+            response = self.client.chat.completions.create(
+                model="gpt-4.1-mini",
+                messages=[
+                    {"role": "system", "content": "You detect languages. Reply with just the language name."},
+                    {"role": "user", "content": detect_prompt}
+                ],
+                temperature=0.2,
+                max_tokens=10
+            )
+            
+            self.language = response.choices[0].message.content.strip()
+            print(f"Detected language: {self.language}")
+            
+        except Exception as e:
+            print(f"Error detecting language: {e}")
+    
+    def translate_chunk(self, text):
+        """Translate the latest chunk to English"""
+        try:
+            translate_prompt = f"""Translate this {self.language} text to English:
+            
+            {text}
+            """
+            
+            response = self.client.chat.completions.create(
+                model="gpt-4.1-mini",
+                messages=[
+                    {"role": "system", "content": f"You are a {self.language} to English translator. Translate directly without explanations."},
+                    {"role": "user", "content": translate_prompt}
+                ],
+                temperature=0.3,
+                max_tokens=100
+            )
+            
+            translated_text = response.choices[0].message.content.strip()
+            if translated_text:
+                self.translation += " " + translated_text
+            
+        except Exception as e:
+            print(f"Error translating text: {e}")
+    
+    def get_transcript(self):
+        """Get the current transcript"""
+        return self.transcript.strip()
+    
+    def get_translation(self):
+        """Get the current translation"""
+        return self.translation.strip()
+    
+    def get_language(self):
+        """Get the detected language"""
+        return self.language
+
+# Function to detect language and translate non-English transcriptions to English
+def detect_and_translate(text):
+    """
+    Detect if the text is in English and translate it to English if it's not.
+    Uses GPT-4.1-mini for language detection and translation.
+    
+    Args:
+        text: The transcription text to detect language and possibly translate
+        
+    Returns:
+        Tuple containing (is_english, translated_text, detected_language)
+    """
+    try:
+        # Get API key
+        api_key = get_api_key("OPENAI_API_KEY")
+        if not api_key:
+            return True, text, "Unknown"  # Assume English if no API key
+        
+        # Create a client instance
+        client = openai.OpenAI(api_key=api_key)
+        
+        # First, detect the language
+        detect_prompt = f"""Analyze the following text and determine the language:
+
+Text: {text[:500]}...  # Only using first 500 chars for detection
+
+Your response should be in the format:
+Language: [language name]
+Is English (yes/no): [yes or no]
+Confidence (1-10): [1-10 scale where 10 is highest]
+
+Keep your response brief and to the point."""
+        
+        detect_response = client.chat.completions.create(
+            model="gpt-4.1-mini",
+            messages=[
+                {"role": "system", "content": "You are a language detection specialist. Analyze the text and identify its language. Be brief and precise."},
+                {"role": "user", "content": detect_prompt}
+            ],
+            temperature=0.3
+        )
+        
+        detection_result = detect_response.choices[0].message.content
+        print(f"Language detection result: {detection_result}")
+        
+        # Parse detection result - changed to be more lenient
+        is_english = "yes" in detection_result.lower() and "is english" in detection_result.lower()
+        
+        # If confidence level is mentioned and is low for English, don't treat as English
+        confidence_level = 10  # Default high confidence
+        for line in detection_result.split('\n'):
+            if line.lower().startswith("confidence"):
+                try:
+                    # Extract the confidence value (1-10)
+                    confidence_parts = line.split(':')
+                    if len(confidence_parts) > 1:
+                        confidence_str = confidence_parts[1].strip()
+                        # Extract just the number
+                        confidence_str = ''.join(c for c in confidence_str if c.isdigit())
+                        if confidence_str:
+                            confidence_level = int(confidence_str)
+                except ValueError:
+                    # If parsing fails, keep default
+                    pass
+        
+        # If it's detected as English but with low confidence (< 7), don't treat as English
+        if is_english and confidence_level < 7:
+            is_english = False
+            print(f"Detected as English but with low confidence ({confidence_level}/10), treating as non-English")
+        
+        # Extract language name
+        language_name = "Unknown"
+        for line in detection_result.split('\n'):
+            if line.lower().startswith("language:"):
+                language_name = line.split(':', 1)[1].strip()
+                break
+        
+        # For testing - always show the detected language and confidence in console
+        print(f"Detected language: {language_name}, Is English: {is_english}, Confidence: {confidence_level}/10")
+        
+        # If not English, translate
+        if not is_english:
+            translate_prompt = f"""Translate the following text from {language_name} to English:
+
+{text}
+
+Provide only the translated text without any additional comments or notes."""
+            
+            translate_response = client.chat.completions.create(
+                model="gpt-4.1-mini",
+                messages=[
+                    {"role": "system", "content": "You are a professional translator. Translate the given text to English while preserving the meaning, tone, and style of the original."},
+                    {"role": "user", "content": translate_prompt}
+                ],
+                temperature=0.3
+            )
+            
+            translated_text = translate_response.choices[0].message.content
+            return False, translated_text, language_name
+        
+        # If English, return the original text
+        return True, text, language_name
+        
+    except Exception as e:
+        st.error(f"Error detecting language or translating: {str(e)}")
+        print(f"Translation API error: {str(e)}")
+        return True, text, "Unknown"  # Assume English on error
+
 # Function to generate a summary using GPT-4
 def generate_summary(text, summary_type):
     """Generate a summary of the transcription using OpenAI's GPT models"""
     try:
+        # Get API key from secrets or environment variables
+        api_key = get_api_key("OPENAI_API_KEY")
+        if not api_key:
+            st.warning("OpenAI API key is required for generating summaries. Please enter it in the sidebar.")
+            return None
+            
+        # Create a client instance with API key
+        client = openai.OpenAI(api_key=api_key)
+        
         # Choose model and prompt based on Whisper model availability and preferences
         model = "gpt-4.1"  # Fallback to GPT-4o Mini as it's sufficient for summary
         
@@ -485,8 +787,8 @@ def generate_summary(text, summary_type):
             
             user_prompt = f"Please provide a concise general summary of the following transcription:\n\n{text}"
         
-        # Make API call
-        response = openai.chat.completions.create(
+        # Make API call using the initialized client
+        response = client.chat.completions.create(
             model=model,
             messages=[
                 {"role": "system", "content": system_prompt},
@@ -517,74 +819,19 @@ def generate_claude_summary(text, summary_type):
         claude_client = anthropic.Anthropic(api_key=claude_key)
         
         if summary_type == "meeting":
-            system_prompt = """You are an expert meeting summarizer who functions like a professional Project Manager. Your role is to transform meeting transcriptions into clear, actionable summaries that capture essential information and next steps.
-
-FORMAT YOUR RESPONSE WITH THESE SECTIONS:
-
-1. EXECUTIVE SUMMARY (2-3 sentences)
-   - Provide a concise overview of the meeting purpose and main outcomes
-
-2. KEY PARTICIPANTS
-   - List all individuals mentioned in the transcript with their roles (if available)
-
-3. COMPLETED ITEMS
-   - Bullet list of tasks/projects reported as completed
-   - Include who completed each item and when (if mentioned)
-   - If none mentioned, write "None mentioned"
-
-4. ONGOING WORK
-   - Bullet list of tasks/projects currently in progress
-   - Include status updates, owners, and deadlines (if mentioned)
-   - Note any revised timelines or scope changes
-   - If none mentioned, write "None mentioned"
-
-5. BLOCKERS & CHALLENGES
-   - Bullet list of identified obstacles, issues, or concerns
-   - Include potential impacts and current status for each issue
-   - If none mentioned, write "None mentioned"
-
-6. IDEAS & DISCUSSIONS
-   - Bullet list of key concepts, suggestions, or topics explored
-   - Note any decisions made during discussions
-   - If none mentioned, write "None mentioned"
-
-7. ACTION ITEMS
-   - Bullet list of specific tasks assigned during the meeting
-   - Format each item as: [OWNER] - [ACTION] by [DEADLINE if mentioned]
-   - If unclear who owns a task, indicate "Owner unspecified"
-   - If none mentioned, write "None mentioned"
-
-8. TEAM INITIATIVES
-   - Bullet list of activities that require coordinated team effort
-   - Include any resource requirements mentioned
-   - If none mentioned, write "None mentioned"
-
-9. KEY ISSUES ANALYSIS
-   For each significant problem or topic discussed, provide:
-   
-   [TOPIC]
-   - What? (Describe the issue or topic precisely)
-   - So What? (Explain the importance or implications)
-   - What's Next? (Outline the planned approach or resolution)
-
-   Note: Only include this section if specific issues were discussed in detail. For each question with no clear answer in the transcript, write "N/A" - do not fabricate responses.
-
-10. FOLLOW-UP SCHEDULE
-    - Note any mentioned follow-up meetings or check-ins
-    - If none mentioned, write "None specified"
-
-11. ADDITIONAL NOTES
-    - Include any other relevant information that doesn't fit elsewhere
-    - If none, omit this section
-
-IMPORTANT GUIDELINES:
-- Maintain a neutral, professional tone throughout
-- Use clear, concise language focused on facts and outcomes
-- Include names when activities are associated with specific individuals
-- Do not add information that wasn't in the original transcript
-- Prioritize clarity and actionability in your summary
-- For the "Key Issues Analysis" section, only include topics that received significant discussion
-- Never force information into categories if it wasn't discussed - use "None mentioned" appropriately"""
+            system_prompt = """You are a professional meeting summarizer specialized in creating structured, concise summaries of conversations and meetings.
+            Your summaries should highlight the key points, decisions made, action items, and next steps discussed.
+            Present your summary in a structured format with the following sections:
+            
+            - Overall Summary: A brief 2-3 sentence overview of what the meeting was about
+            - Completed: Items/tasks reported as completed
+            - Ongoing: Tasks/projects currently in progress
+            - Blockers: Any obstacles or issues mentioned
+            - Ideas Discussed: Key concepts or suggestions that were brought up
+            - To Do: Specific action items and who they're assigned to
+            - Action Points We Need to Start as a Team
+            
+            Make sure to format each section with appropriate bullet points and include names of people mentioned for action items when available. If a particular section has no content, indicate "None mentioned" under that heading."""
             
             user_prompt = f"Please summarize the following meeting transcript in a structured format highlighting key points, decisions and action items:\n\n{text}"
             
@@ -983,6 +1230,16 @@ st.markdown("""
     box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
     border-left: 4px solid #1B5E20;  /* Darker green accent */
 }
+.translation-container {
+    background-color: #1565C0;  /* Blue background */
+    border-radius: 10px;
+    padding: 20px;
+    margin-top: 20px;
+    color: #FFFFFF;  /* White text for better contrast */
+    font-weight: 500;
+    box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+    border-left: 4px solid #0D47A1;  /* Darker blue accent */
+}
 .real-time-transcript {
     background-color: #1565C0;  /* Blue background */
     border-radius: 10px;
@@ -1041,6 +1298,11 @@ st.markdown("""
         background-color: #2E7D32;  /* Keep same green in dark mode */
         color: #FFFFFF;
         border-left: 4px solid #1B5E20;
+    }
+    .translation-container {
+        background-color: #1565C0;  /* Keep same blue in dark mode */
+        color: #FFFFFF;
+        border-left: 4px solid #0D47A1;
     }
     .real-time-transcript {
         background-color: #1565C0;  /* Keep same blue in dark mode */
@@ -1382,10 +1644,8 @@ else:  # Main app content
         file_tab = tabs[0]
     else:
         # In local environment, show all tabs
-        # tabs = st.tabs(["Microphone Recording", "Real-time Transcription", "File Upload"])
-        # mic_tab, realtime_tab, file_tab = tabs
-        tabs = st.tabs(["Microphone Recording", "File Upload"])
-        mic_tab, file_tab = tabs
+        tabs = st.tabs(["Microphone Recording", "Real-time Transcription", "File Upload"])
+        mic_tab, realtime_tab, file_tab = tabs
     
     # Only display microphone tab if we're in a local environment
     if not is_cloud_env and AUDIO_RECORDING_AVAILABLE:
@@ -1405,6 +1665,9 @@ else:  # Main app content
                     index=0
                 )
                 model = SPEECH_MODELS[model_key]
+            
+            # Add debug checkbox for testing translation
+            show_debug = st.checkbox("Debug mode (force translation option)", value=False, help="Enable this to always show the translation button for testing")
             
             # Record button
             if st.button("Start Recording", type="primary", key="record_btn"):
@@ -1437,6 +1700,61 @@ else:  # Main app content
                                 "transcription.txt", 
                                 "📥 Download Transcription"
                             )
+                            
+                            # Check if the transcription is in English
+                            # Initialize session state for translation
+                            if 'translation_clicked' not in st.session_state:
+                                st.session_state.translation_clicked = False
+                            if 'translation_result' not in st.session_state:
+                                st.session_state.translation_result = None
+                            if 'detected_language' not in st.session_state:
+                                st.session_state.detected_language = None
+                            
+                            # Create function to update state without page rerun
+                            def translation_callback():
+                                st.session_state.translation_clicked = True
+                            
+                            # Check language and offer translation if needed
+                            with st.spinner("Detecting language..."):
+                                is_english, _, detected_language = detect_and_translate(transcription)
+                                st.session_state.detected_language = detected_language
+                            
+                            # Always show detected language
+                            st.info(f"Detected language: {detected_language}" + 
+                                    (" (no translation needed)" if is_english and not show_debug else ""))
+                            
+                            # Show translate button if not English or if debug mode is enabled
+                            if not is_english or show_debug:
+                                st.button("Translate to English", on_click=translation_callback, type="primary", key="translate_btn")
+                            
+                            # Perform translation if button was clicked
+                            if st.session_state.translation_clicked:
+                                # Handle both cases - when language is detected as non-English,
+                                # and when debug mode forces the translation option
+                                with st.spinner(f"Translating from {detected_language} to English..."):
+                                    # Only translate if we haven't done so already
+                                    if not st.session_state.translation_result:
+                                        # If it's actually English but we're in debug mode, just use the original text
+                                        if is_english and show_debug:
+                                            st.session_state.translation_result = "(Debug mode - original text shown as translation)\n\n" + transcription
+                                        else:
+                                            _, translated_text, _ = detect_and_translate(transcription)
+                                            st.session_state.translation_result = translated_text
+                            
+                                # Display the translation
+                                if st.session_state.translation_result:
+                                    st.markdown("### English Translation")
+                                    st.markdown(f"<div class='translation-container'>{st.session_state.translation_result}</div>", unsafe_allow_html=True)
+                                    
+                                    # Add download button for translation
+                                    get_text_download_link(
+                                        st.session_state.translation_result,
+                                        "translation.txt",
+                                        "📥 Download Translation"
+                                    )
+                                    
+                                    # Reset the translation clicked state for next time
+                                    st.session_state.translation_clicked = False
                             
                             # Add summary options
                             st.markdown("### Generate Summary")
@@ -1617,208 +1935,198 @@ else:  # Main app content
                             st.error("Recording failed. Please check your microphone permissions.")
 
     # Only display real-time tab if we're in a local environment
-    # with realtime_tab:
-    #     st.header("Real-time Transcription with GPT-4o")
-    #     st.markdown("Transcribe audio in real-time using OpenAI's Realtime API and gpt-4o-transcribe model")
-    #     
-    #     # Initialize session state for streaming
-    #     if 'realtime_streaming' not in st.session_state:
-    #         st.session_state.realtime_streaming = False
-    #         st.session_state.realtime_transcriber = None
-    #         st.session_state.ws_error = None
-    #     
-    #     # Display any WebSocket connection errors
-    #     if st.session_state.get('ws_error'):
-    #         st.error(f"WebSocket Error: {st.session_state.ws_error}")
-    #         st.session_state.ws_error = None
-    #     
-    #     # Start/Stop streaming buttons
-    #     col1, col2 = st.columns(2)
-    #     with col1:
-    #         start_button = st.button("Start Streaming", type="primary", disabled=st.session_state.realtime_streaming, key="start_realtime")
-    #     with col2:
-    #         stop_button = st.button("Stop Streaming", type="secondary", disabled=not st.session_state.realtime_streaming, key="stop_realtime")
-    #     
-    #     # Transcript placeholder
-    #     realtime_transcript_container = st.empty()
-    #     
-    #     if start_button:
-    #         # Get API key from secrets, environment, or user input
-    #         api_key = get_api_key("OPENAI_API_KEY") or st.session_state.get('openai_api_key')
-    #         if not api_key:
-    #             st.error("API key is required for real-time transcription")
-    #         else:
-    #             st.session_state.realtime_streaming = True
-    #             st.session_state.realtime_transcriber = RealtimeTranscription(api_key)
-    #             
-    #             try:
-    #                 success = st.session_state.realtime_transcriber.start()
-    #                 if success:
-    #                     realtime_transcript_container.markdown("<div class='real-time-transcript'>Listening... (WebSocket connection with GPT-4o Transcribe)</div>", unsafe_allow_html=True)
-    #                     
-    #                     # Check if connection was successful after a short delay
-    #                     time.sleep(2)
-    #                     if not st.session_state.realtime_transcriber.is_connected:
-    #                         error = st.session_state.realtime_transcriber.get_error() or "Failed to establish WebSocket connection"
-    #                         st.session_state.ws_error = f"{error}. Please check your API key and try again."
-    #                         st.session_state.realtime_streaming = False
-    #                         st.session_state.realtime_transcriber.stop()
-    #                         st.session_state.realtime_transcriber = None
-    #                         st.rerun()
-    #                 else:
-    #                     # Get the error from the transcriber
-    #                     error = st.session_state.realtime_transcriber.get_error() or "Failed to start real-time transcription"
-    #                     st.error(error)
-    #                     st.session_state.realtime_streaming = False
-    #                     st.session_state.realtime_transcriber = None
-    #             except Exception as e:
-    #                 st.session_state.ws_error = str(e)
-    #                 st.session_state.realtime_streaming = False
-    #                 st.rerun()
-    #             
-    #             # Rerun to update UI state
-    #             st.rerun()
-    #     
-    #     if stop_button and st.session_state.realtime_streaming:
-    #         if st.session_state.realtime_transcriber:
-    #             st.session_state.realtime_transcriber.stop()
-    #             final_transcript = st.session_state.realtime_transcriber.get_transcript()
-    #             realtime_transcript_container.markdown(f"<div class='real-time-transcript'>{final_transcript}</div>", unsafe_allow_html=True)
-    #             st.session_state.realtime_streaming = False
-    #             
-    #             # Add download button for real-time transcription
-    #             get_text_download_link(
-    #                 final_transcript,
-    #                 "realtime_transcription.txt",
-    #                 "📥 Download Transcription"
-    #             )
-    #             
-    #             # Store transcription in session state
-    #             st.session_state.rt_transcription = final_transcript
-    #             
-    #             # Success message
-    #             st.success("Transcription completed!")
-    #             
-    #             # Add summary options if transcript is available
-    #             if final_transcript:
-    #                 st.markdown("### Generate Summary")
-    #                 rt_summary_col1, rt_summary_col2 = st.columns(2)
-    #                 rt_summary_container = st.empty()
-    #                 
-    #                 # Add keys to session state to track button clicks without page rerun
-    #                 if 'rt_meeting_summary_clicked' not in st.session_state:
-    #                     st.session_state.rt_meeting_summary_clicked = False
-    #                 if 'rt_general_summary_clicked' not in st.session_state:
-    #                     st.session_state.rt_general_summary_clicked = False
-    #                 
-    #                 # Create functions to update state without page rerun
-    #                 def rt_meeting_summary_callback():
-    #                     st.session_state.rt_meeting_summary_clicked = True
-    #                 
-    #                 def rt_general_summary_callback():
-    #                     st.session_state.rt_general_summary_clicked = True
-    #                 
-    #                 with rt_summary_col1:
-    #                     st.button("Meeting Conversation", key="rt_meeting_summary_btn", on_click=rt_meeting_summary_callback)
-    #                 
-    #                 with rt_summary_col2:
-    #                     st.button("General Summary", key="rt_general_summary_btn", on_click=rt_general_summary_callback)
-    #                 
-    #                 # Generate and display summaries without page rerun
-    #                 if st.session_state.rt_meeting_summary_clicked:
-    #                     with st.spinner("Generating meeting summary..."):
-    #                         # Check if summary already exists in session state
-    #                         if 'rt_meeting_summary' not in st.session_state.summaries:
-    #                             meeting_summary = generate_summary(final_transcript, "meeting")
-    #                             if meeting_summary:
-    #                                 st.session_state.summaries['rt_meeting_summary'] = meeting_summary
-    #                         st.session_state.rt_meeting_summary_clicked = False  # Reset for next time
-    #                         
-    #                         # Display the formatted summary
-    #                         if 'rt_meeting_summary' in st.session_state.summaries:
-    #                             rt_summary_container.markdown("### Meeting Summary")
-    #                             # Apply formatting to the meeting summary
-    #                             formatted_summary = format_meeting_summary(st.session_state.summaries['rt_meeting_summary'])
-    #                             rt_summary_container.markdown(
-    #                                 f"<div class='summary-container'>{formatted_summary}</div>", 
-    #                                 unsafe_allow_html=True
-    #                             )
-    #                             
-    #                             # Add download button for meeting summary
-    #                             get_text_download_link(
-    #                                 st.session_state.summaries['rt_meeting_summary'],
-    #                                 "realtime_meeting_summary.txt",
-    #                                 "📥 Download Meeting Summary"
-    #                             )
-    #                 
-    #                 if st.session_state.rt_general_summary_clicked:
-    #                     with st.spinner("Generating general summary..."):
-    #                         # Check if summary already exists in session state
-    #                         if 'rt_general_summary' not in st.session_state.summaries:
-    #                             general_summary = generate_summary(final_transcript, "general")
-    #                             if general_summary:
-    #                                 st.session_state.summaries['rt_general_summary'] = general_summary
-    #                         st.session_state.rt_general_summary_clicked = False  # Reset for next time
-    #                         
-    #                         # Display the summary
-    #                         if 'rt_general_summary' in st.session_state.summaries:
-    #                             rt_summary_container.markdown("### General Summary")
-    #                             rt_summary_container.markdown(
-    #                                 f"<div class='summary-container'>{st.session_state.summaries['rt_general_summary']}</div>", 
-    #                                 unsafe_allow_html=True
-    #                             )
-    #                             
-    #                             # Add download button for general summary from previous run
-    #                             get_text_download_link(
-    #                                 st.session_state.summaries['rt_general_summary'],
-    #                                 "realtime_general_summary.txt",
-    #                                 "📥 Download General Summary"
-    #                             )
-    #                 
-    #                 # Check if we have any summaries from previous runs to display
-    #                 if not st.session_state.rt_meeting_summary_clicked and not st.session_state.rt_general_summary_clicked:
-    #                     if 'rt_meeting_summary' in st.session_state.summaries:
-    #                         rt_summary_container.markdown("### Meeting Summary")
-    #                         # Apply formatting to the meeting summary
-    #                         formatted_summary = format_meeting_summary(st.session_state.summaries['rt_meeting_summary'])
-    #                         rt_summary_container.markdown(
-    #                             f"<div class='summary-container'>{formatted_summary}</div>", 
-    #                             unsafe_allow_html=True
-    #                         )
-    #                         
-    #                         # Add download button for meeting summary from previous run
-    #                         get_text_download_link(
-    #                             st.session_state.summaries['rt_meeting_summary'],
-    #                             "realtime_meeting_summary.txt",
-    #                             "📥 Download Meeting Summary"
-    #                         )
-    #                     elif 'rt_general_summary' in st.session_state.summaries:
-    #                         rt_summary_container.markdown("### General Summary")
-    #                         rt_summary_container.markdown(
-    #                             f"<div class='summary-container'>{st.session_state.summaries['rt_general_summary']}</div>", 
-    #                             unsafe_allow_html=True
-    #                         )
-    #                         
-    #                         # Add download button for general summary from previous run
-    #                         get_text_download_link(
-    #                             st.session_state.summaries['rt_general_summary'],
-    #                             "realtime_general_summary.txt",
-    #                             "📥 Download General Summary"
-    #                         )
-    #             
-    #             # Rerun to update UI state
-    #             st.rerun()
-    #     
-    #     # Update the transcript in real-time if streaming
-    #     if st.session_state.realtime_streaming and st.session_state.realtime_transcriber:
-    #         # Update every second
-    #         current_transcript = st.session_state.realtime_transcriber.get_transcript()
-    #         if current_transcript:
-    #             realtime_transcript_container.markdown(f"<div class='real-time-transcript'>{current_transcript}</div>", unsafe_allow_html=True)
-    #         
-    #         # Add automatic rerun for real-time updates
-    #         time.sleep(0.5)  # Brief pause
-    #         st.rerun()
+    with realtime_tab:
+        st.header("Enhanced Real-time Transcription")
+        st.markdown("Transcribe and translate audio in real-time with chunked processing")
+        
+        # Initialize session state for chunked streaming
+        if 'chunked_streaming' not in st.session_state:
+            st.session_state.chunked_streaming = False
+            st.session_state.audio_processor = None
+        
+        # Display any connection errors
+        if 'realtime_error' in st.session_state and st.session_state.realtime_error:
+            st.error(f"Error: {st.session_state.realtime_error}")
+            st.session_state.realtime_error = None
+        
+        # Add debug checkbox for testing
+        show_debug_realtime = st.checkbox("Debug mode (shows more info)", value=False, 
+                               help="Enable this for troubleshooting connection issues", key="debug_new_realtime")
+        
+        # Add translation toggle
+        show_translation = st.checkbox("Enable automatic translation", value=True,
+                            help="Automatically translate non-English speech to English")
+        
+        # Start/Stop streaming buttons
+        col1, col2 = st.columns(2)
+        with col1:
+            start_button = st.button("Start Streaming", type="primary", 
+                                    disabled=st.session_state.chunked_streaming, 
+                                    key="start_chunked_realtime")
+        with col2:
+            stop_button = st.button("Stop Streaming", type="secondary", 
+                                   disabled=not st.session_state.chunked_streaming, 
+                                   key="stop_chunked_realtime")
+        
+        # Create placeholders for transcript and translation
+        realtime_transcript_container = st.empty()
+        realtime_translation_container = st.empty()
+        
+        if start_button:
+            # Get API key from secrets, environment, or user input
+            api_key = get_api_key("OPENAI_API_KEY") or st.session_state.get('openai_api_key')
+            if not api_key:
+                st.error("API key is required for real-time transcription")
+            else:
+                try:
+                    # Initialize audio processor
+                    st.session_state.audio_processor = ChunkedAudioProcessor(api_key)
+                    st.session_state.chunked_streaming = True
+                    
+                    # Set up audio stream with sounddevice
+                    if not AUDIO_RECORDING_AVAILABLE or sd is None:
+                        st.error("Microphone recording is not available in this environment")
+                    else:
+                        # Audio callback function for streaming
+                        def audio_callback(indata, frames, time_info, status):
+                            """Callback to capture audio data from microphone"""
+                            if status:
+                                print(f"Audio status: {status}")
+                            
+                            # Convert float32 audio data to int16
+                            audio_data = (indata * 32767).astype(np.int16).tobytes()
+                            
+                            # Add to processor
+                            if st.session_state.audio_processor:
+                                st.session_state.audio_processor.add_audio_chunk(audio_data)
+                        
+                        # Start stream
+                        stream = sd.InputStream(
+                            samplerate=16000,
+                            channels=1,
+                            callback=audio_callback
+                        )
+                        stream.start()
+                        
+                        # Store stream in session state
+                        st.session_state.audio_stream = stream
+                        
+                        realtime_transcript_container.markdown(
+                            "<div class='real-time-transcript'>Listening... (Chunked processing active)</div>", 
+                            unsafe_allow_html=True
+                        )
+                        
+                        if show_debug_realtime:
+                            st.success("Audio streaming started successfully!")
+                
+                except Exception as e:
+                    st.session_state.realtime_error = str(e)
+                    st.session_state.chunked_streaming = False
+                    st.session_state.audio_processor = None
+                    if show_debug_realtime:
+                        st.error(f"Exception details: {e}")
+                    st.rerun()
+                
+                # Rerun to update UI state
+                st.rerun()
+        
+        if stop_button and st.session_state.chunked_streaming:
+            if 'audio_stream' in st.session_state and st.session_state.audio_stream:
+                st.session_state.audio_stream.stop()
+                st.session_state.audio_stream.close()
+                
+            # Get final transcript and translation
+            final_transcript = ""
+            final_translation = ""
+            detected_language = "Unknown"
+            
+            if st.session_state.audio_processor:
+                final_transcript = st.session_state.audio_processor.get_transcript()
+                final_translation = st.session_state.audio_processor.get_translation()
+                detected_language = st.session_state.audio_processor.get_language()
+            
+            # Display final transcript
+            if final_transcript:
+                realtime_transcript_container.markdown(
+                    f"<div class='real-time-transcript'>{final_transcript}</div>", 
+                    unsafe_allow_html=True
+                )
+                
+                # Add download button for real-time transcription
+                get_text_download_link(
+                    final_transcript,
+                    "realtime_transcription.txt",
+                    "📥 Download Transcription"
+                )
+                
+                # Display language detection and translation if available
+                if detected_language != "Unknown":
+                    st.info(f"Detected language: {detected_language}")
+                    
+                    if detected_language != "English" and final_translation:
+                        realtime_translation_container.markdown(
+                            f"<div class='translation-container'>{final_translation}</div>", 
+                            unsafe_allow_html=True
+                        )
+                        
+                        # Add download button for translation
+                        get_text_download_link(
+                            final_translation,
+                            "realtime_translation.txt",
+                            "📥 Download Translation"
+                        )
+                
+                # Store in session state for summary generation
+                st.session_state.rt_transcription = final_transcript
+            
+            # Reset session state
+            st.session_state.chunked_streaming = False
+            st.session_state.audio_processor = None
+            
+            # Success message
+            st.success("Transcription completed!")
+            
+            # Show summary options after stopping
+            if final_transcript:
+                # Add summary options
+                st.markdown("### Generate Summary")
+                # [Summary options code as before]
+            
+            # Rerun to update UI state
+            st.rerun()
+        
+        # Update the transcript in real-time if streaming
+        if st.session_state.chunked_streaming and st.session_state.audio_processor:
+            # Get current transcript and translation
+            current_transcript = st.session_state.audio_processor.get_transcript()
+            current_translation = st.session_state.audio_processor.get_translation()
+            current_language = st.session_state.audio_processor.get_language()
+            
+            # Update transcript display
+            if current_transcript:
+                realtime_transcript_container.markdown(
+                    f"<div class='real-time-transcript'>{current_transcript}</div>", 
+                    unsafe_allow_html=True
+                )
+                
+                # Show translation if available and enabled
+                if show_translation and current_language not in ["English", "Unknown"] and current_translation:
+                    realtime_translation_container.markdown(
+                        f"<div class='translation-container'>{current_translation}</div>", 
+                        unsafe_allow_html=True
+                    )
+                    
+                    # Show detected language in debug mode
+                    if show_debug_realtime:
+                        st.info(f"Detected language: {current_language}")
+            
+            # Show debug info if enabled
+            if show_debug_realtime:
+                st.info(f"Audio chunk size: {st.session_state.audio_processor.chunk_duration_ms}ms | Processing active: {st.session_state.audio_processor.is_processing}")
+            
+            # Add automatic rerun for real-time updates
+            time.sleep(0.3)  # Brief pause (shorter than chunk size)
+            st.rerun()
 
     # File upload tab (available in all environments)
     with file_tab:
@@ -1875,7 +2183,7 @@ else:  # Main app content
             # Transcribe/Translate and Summarize button
             button_text = "Translate and Summarize" if translate else "Transcribe and Summarize"
             if st.button(button_text, type="primary", key="transcribe_file"):
-                # For videos, first extract the audio
+                # For videos and m4a files, first extract the audio or convert to mp3
                 audio_file_for_transcription = temp_file_path
                 temp_files_to_clean = [temp_file_path]  # Track files to clean up
                 
@@ -1904,6 +2212,39 @@ else:  # Main app content
                             # Clean up the original temp file
                             os.unlink(temp_file_path)
                             st.stop()
+                # Handle m4a files by converting to mp3 first to avoid format compatibility issues
+                elif file_extension == "m4a":
+                    with st.spinner("Converting audio format..."):
+                        try:
+                            # Load the audio file
+                            audio = AudioSegment.from_file(temp_file_path, format="m4a")
+                            
+                            # Create a temporary MP3 file
+                            temp_mp3_file = tempfile.NamedTemporaryFile(delete=False, suffix='.mp3')
+                            temp_mp3_path = temp_mp3_file.name
+                            temp_mp3_file.close()
+                            
+                            # Export to MP3
+                            audio.export(temp_mp3_path, format="mp3", bitrate="192k")
+                            
+                            # Update the audio file path for transcription
+                            audio_file_for_transcription = temp_mp3_path
+                            temp_files_to_clean.append(temp_mp3_path)
+                            
+                            # Get file size and duration
+                            file_size_mb = os.path.getsize(temp_mp3_path) / (1024 * 1024)
+                            duration_seconds = len(audio) / 1000
+                            hours = int(duration_seconds // 3600)
+                            minutes = int((duration_seconds % 3600) // 60)
+                            seconds = int(duration_seconds % 60)
+                            duration_formatted = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+                            
+                            st.success(f"✅ Audio converted successfully! MP3 file size: {file_size_mb:.2f} MB, Duration: {duration_formatted}")
+                        except Exception as e:
+                            st.error(f"Failed to convert M4A to MP3: {str(e)}")
+                            # Clean up the original temp file
+                            os.unlink(temp_file_path)
+                            st.stop()
                 
                 # Proceed with transcription using the audio file
                 with st.spinner(f"{'Translating' if translate else 'Transcribing'} audio..."):
@@ -1923,6 +2264,55 @@ else:  # Main app content
                         download_filename,
                         f"📥 Download {'Translation' if translate else 'Transcription'}"
                     )
+                    
+                    # Only check for language and offer translation if not already translating
+                    if not translate:
+                        # Initialize session state for translation in file upload tab
+                        if 'file_translation_clicked' not in st.session_state:
+                            st.session_state.file_translation_clicked = False
+                        if 'file_translation_result' not in st.session_state:
+                            st.session_state.file_translation_result = None
+                        if 'file_detected_language' not in st.session_state:
+                            st.session_state.file_detected_language = None
+                        
+                        # Create function to update state without page rerun
+                        def file_translation_callback():
+                            st.session_state.file_translation_clicked = True
+                        
+                        # Check language and offer translation if needed
+                        with st.spinner("Detecting language..."):
+                            is_english, _, detected_language = detect_and_translate(transcription)
+                            st.session_state.file_detected_language = detected_language
+                        
+                        if not is_english:
+                            st.info(f"Detected language: {detected_language}")
+                            # Show a translate button if not English
+                            st.button("Translate to English", on_click=file_translation_callback, type="primary", key="file_translate_btn")
+                        else:
+                            st.info(f"Detected language: {detected_language} (no translation needed)")
+                        
+                        # Perform translation if button was clicked
+                        if st.session_state.file_translation_clicked and not is_english:
+                            with st.spinner(f"Translating from {detected_language} to English..."):
+                                # Only translate if we haven't done so already
+                                if not st.session_state.file_translation_result:
+                                    _, translated_text, _ = detect_and_translate(transcription)
+                                    st.session_state.file_translation_result = translated_text
+                            
+                            # Display the translation
+                            if st.session_state.file_translation_result:
+                                st.markdown("### English Translation")
+                                st.markdown(f"<div class='translation-container'>{st.session_state.file_translation_result}</div>", unsafe_allow_html=True)
+                                
+                                # Add download button for translation
+                                get_text_download_link(
+                                    st.session_state.file_translation_result,
+                                    "translation.txt",
+                                    "📥 Download Translation"
+                                )
+                                
+                                # Reset the translation clicked state for next time
+                                st.session_state.file_translation_clicked = False
                     
                     # Create tabs for GPT and Claude summaries
                     if use_claude:
@@ -2129,3 +2519,4 @@ if is_cloud_env:
 # Footer
 st.markdown("---")
 st.markdown("Built with Streamlit and OpenAI's speech recognition technology")
+
